@@ -480,7 +480,7 @@ const TICK_MS = Number(process.env.TICK_MS) || 20000;
 // Global knobs (editable live in the Sim tab, persisted in kv 'settings').
 //  postMult/replyMult: sim-speed multipliers on every account's ppd/rpd. 1 = real-time schedule, 60 = a sim-hour per real minute.
 //  idlePause: don't spend API credits while nobody has the site open.
-let settings = { postMult: Number(process.env.POST_MULT) || 6, replyMult: Number(process.env.REPLY_MULT) || 6, paused: false, idlePause: process.env.IDLE_PAUSE !== 'false', maxPerTick: 8, maxRepliesPerTick: 6, simBudget: 350, simReplyBudget: 120 };
+let settings = { postMult: Number(process.env.POST_MULT) || 6, replyMult: Number(process.env.REPLY_MULT) || 6, paused: false, idlePause: process.env.IDLE_PAUSE !== 'false', maxPerTick: 8, maxRepliesPerTick: 6, simBudget: 350, simReplyBudget: 120, dailyCap: Number(process.env.DAILY_CAP_USD ?? 3) /* $/day, 0 = no cap */ };
 let lastActive = Date.now();
 let simState = { day: 0 };
 const saveKV = (k, v) => q(`INSERT INTO kv VALUES($1,$2,now()) ON CONFLICT (k) DO UPDATE SET v=$2, updated_at=now()`, [k, JSON.stringify(v)]);
@@ -562,7 +562,7 @@ const CAND_SQL = `SELECT p.id AS pid, p.author_id, p.text, p.likes_target, a.han
   WHERE p.parent_id IS NULL AND p.created_at <= now() AND p.created_at > now() - interval '8 hours' ORDER BY p.created_at DESC LIMIT 120`;
 
 async function tick() {
-  if (simJob.running || seeding || settings.paused) return;
+  if (simJob.running || seeding || settings.paused || overCap()) return;
   if (settings.idlePause && Date.now() - lastActive > 10 * 60000) return;
   const accts = await q(`SELECT * FROM accounts WHERE kind IN ('celeb','commentary','news')`);
   const dt = TICK_MS / 1000;
@@ -649,6 +649,7 @@ async function postSim(days) {
 
 async function simulate(days) {
   if (simJob.running) return false;
+  if (overCap()) { slog(`Daily API cap ($${settings.dailyCap}) reached — raise it in Live speed to keep simulating`); simJob.auto.on = false; return false; }
   Object.assign(simJob, { running: true, stop: false, startedAt: Date.now(), phase: 'Starting', done: 0, total: 0 });
   slog(`Fast-forwarding ${days} day${days > 1 ? 's' : ''}…`);
   try {
@@ -687,6 +688,7 @@ app.post('/api/sim/settings', auth, wrap(async (req, res) => {
     postMult: num(b.postMult, 0, 5000, settings.postMult), replyMult: num(b.replyMult, 0, 5000, settings.replyMult),
     maxPerTick: num(b.maxPerTick, 1, 30, settings.maxPerTick), maxRepliesPerTick: num(b.maxRepliesPerTick, 0, 30, settings.maxRepliesPerTick),
     simBudget: num(b.simBudget, 20, 2000, settings.simBudget), simReplyBudget: num(b.simReplyBudget, 0, 600, settings.simReplyBudget),
+    dailyCap: num(b.dailyCap, 0, 1000, settings.dailyCap),
     paused: b.paused === undefined ? settings.paused : !!b.paused, idlePause: b.idlePause === undefined ? settings.idlePause : !!b.idlePause };
   await saveKV('settings', settings);
   res.json(simState_());
@@ -716,12 +718,14 @@ async function flushUsage() {
   const keep = Object.keys(usageDays).sort().slice(-14); usageDays = Object.fromEntries(keep.map(k => [k, usageDays[k]]));
   await saveKV('usage', usageDays);
 }
-setInterval(() => flushUsage().catch(e => console.error('usage', e)), 20000);
+const overCap = () => settings.dailyCap > 0 && cost(usageDays[today()] || { in: 0, out: 0 }) >= settings.dailyCap;
+async function refreshCap() { await flushUsage(); ai.setBlocked(overCap()); }
+setInterval(() => refreshCap().catch(e => console.error('usage', e)), 20000);
 const cost = u => (u.in * PRICE_IN + u.out * PRICE_OUT) / 1e6;
 app.get('/api/sim/usage', auth, wrap(async (req, res) => {
   await flushUsage();
   const days = Object.entries(usageDays).sort().slice(-7).map(([date, u]) => ({ date, ...u, cost: cost(u) }));
-  res.json({ days, price: { in: PRICE_IN, out: PRICE_OUT, model: ai.MODEL } });
+  res.json({ days, cap: settings.dailyCap, capped: overCap(), price: { in: PRICE_IN, out: PRICE_OUT, model: ai.MODEL } });
 }));
 
 let seeding = false;
@@ -745,6 +749,7 @@ const PORT = process.env.PORT || 3000;
 init().then(async () => {
   await loadKV();
   { const u = await q1(`SELECT v FROM kv WHERE k='usage'`); if (u) usageDays = u.v; }
+  ai.setBlocked(overCap());
   app.listen(PORT, () => console.log(`[z] listening on ${PORT} · ai=${ai.hasKey ? ai.MODEL : 'OFFLINE FALLBACK (set ANTHROPIC_API_KEY)'} · ${ACCOUNTS.length} accounts`));
   bootstrap().catch(e => console.error('bootstrap', e));
   setInterval(() => tick().catch(e => console.error('tick', e)), TICK_MS);

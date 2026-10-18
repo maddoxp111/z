@@ -4,6 +4,8 @@ const KEY = process.env.ANTHROPIC_API_KEY;
 const als = new AsyncLocalStorage();
 // token usage since last drain (server persists it per day); price: Haiku 5.5 = $0.10 / $0.50 per 1M in/out tokens
 let usage = { calls: 0, in: 0, out: 0, byKind: {} };
+let blocked = false; // set by the server when the daily spending cap is reached
+const setBlocked = b => { blocked = !!b; };
 function drainUsage() { const u = usage; usage = { calls: 0, in: 0, out: 0, byKind: {} }; return u; }
 function track(j) {
   const k = als.getStore() || 'other', u = j.usage || {};
@@ -17,7 +19,7 @@ const BASE = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
 const SAFETY = `This is "Z", a parody social network where every account except the player is AI-written fiction. Keep everything playful and clearly fictional: no real crimes, deaths, diseases, sexual content, slurs, or serious allegations about real people. Output ONLY valid JSON, no prose, no code fences.`;
 
 async function ask(prompt, max = 1800, system = SAFETY) {
-  if (!KEY) return null;
+  if (!KEY || blocked) return null;
   try {
     const r = await fetch(BASE + '/v1/messages', {
       method: 'POST',
@@ -129,4 +131,4 @@ async function genTrends() {
 }
 const gens = { genProfile, genPostsBatch, genAccountReplies, genPosts, genReplies, genUserReplies, genCelebReply, genDMReply, genIncomingDM, genTrends };
 const wrapped = Object.fromEntries(Object.entries(gens).map(([k, f]) => [k, (...args) => als.run(k.replace(/^gen/, '').replace(/^./, c => c.toLowerCase()), () => f(...args))]));
-module.exports = { ...wrapped, drainUsage, blurb, card, hasKey: !!KEY, MODEL };
+module.exports = { ...wrapped, drainUsage, setBlocked, blurb, card, hasKey: !!KEY, MODEL };
