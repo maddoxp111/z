@@ -367,7 +367,8 @@ app.get('/api/poll', auth, wrap(async (req, res) => {
   const fame = await userFollowers(u);
   const last = u.last_dm_at ? Date.now() - new Date(u.last_dm_at) : Infinity;
   const gap = fame > 100000 ? 70000 : 150000;
-  if (last > gap && Math.random() < 0.3) {
+  const myPosts = last > gap ? (await q(`SELECT text FROM posts WHERE author_id=$1 AND created_at<=now() ORDER BY created_at DESC LIMIT 3`, [u.id])).map(r => r.text) : [];
+  if (last > gap && myPosts.length && Math.random() < 0.3) { // nobody DMs you about posts you haven't made
     await q('UPDATE accounts SET last_dm_at=now() WHERE id=$1', [u.id]);
     const celebOk = fame > 20000 && Math.random() < Math.min(0.5, Math.log10(fame / 20000 + 1) * 0.5);
     let sender;
@@ -378,7 +379,7 @@ app.get('/api/poll', auth, wrap(async (req, res) => {
       sender = await q1('SELECT * FROM accounts WHERE id=$1', [id]);
     }
     if (sender) {
-      const text = await ai.genIncomingDM({ userName: u.name, fame, sender, profile: u.profile });
+      const text = await ai.genIncomingDM({ userName: u.name, fame, sender, profile: u.profile, posts: myPosts });
       await q('INSERT INTO dms(user_id,account_id,from_user,text) VALUES($1,$2,false,$3)', [u.id, sender.id, text]);
       if (sender.kind === 'celeb') await q(`INSERT INTO notifs(user_id,type,actor_id,text) VALUES($1,'celeb_dm',$2,'sent you a message')`, [u.id, sender.id]);
     }
