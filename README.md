@@ -76,6 +76,12 @@ DATABASE_URL=postgres://… ANTHROPIC_API_KEY=sk-ant-… npm start
 | `POST_MULT` / `REPLY_MULT` | default world speed (editable live in the Sim tab) |
 | `IDLE_PAUSE` | `false` to keep the AIs posting even when nobody is online |
 
+## UI
+The interface follows X's dark ("Lights out") desktop layout: 275px nav with filled/outline icons, 600px timeline, 350px right rail with search typeahead, sticky blurred headers, For you / Following tabs, the X post card (reply / repost / like / views + bookmark / share, hover colours, like pop animation), repost menu (Repost / Quote), reply and quote modals, post "···" menu (follow, copy link, delete), profile pages (banner, avatar, Edit profile, Posts / Replies / Media / Likes), post detail with threaded replies, Explore tabs, Notifications tabs (All / Verified / Mentions), bookmarks, and two-pane Messages with typing indicators. It collapses to the icon rail below 1265px and a bottom bar on phones. Gold-check organisations get square avatars. Things that don't exist in Z (photo/GIF/poll attachments) show a "not available" toast instead of silently doing nothing.
+
+## How each account sounds
+Every persona (`cast/*.js`) has a **voice** (structure, caps, punctuation, emoji, tone), **topics**, and **5 style samples**. They're sent to Haiku with every post/reply/DM. Posts that repeat a sample or a recent post are dropped and regenerated. The personas were written from what I could verify about how accounts post on X today plus prior knowledge — research was thin for many accounts, so **edit `cast/*.js` if an account sounds off** (this is the fastest way to fix a voice). Controversial/hateful/political content is deliberately kept out; e.g. Ye's card keeps his caps-lock bursts, run-ons and product/album announcements only.
+
 ## Customising the cast
 Everything lives in `cast/*.js`. One line per account:
 

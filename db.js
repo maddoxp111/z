@@ -30,6 +30,7 @@ CREATE INDEX IF NOT EXISTS posts_parent ON posts(parent_id);
 CREATE INDEX IF NOT EXISTS posts_author ON posts(author_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS likes(user_id INT, post_id INT, PRIMARY KEY(user_id, post_id));
 CREATE TABLE IF NOT EXISTS reposts(user_id INT, post_id INT, PRIMARY KEY(user_id, post_id));
+CREATE TABLE IF NOT EXISTS bookmarks(user_id INT, post_id INT, created_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY(user_id, post_id));
 CREATE TABLE IF NOT EXISTS follows(user_id INT, account_id INT, PRIMARY KEY(user_id, account_id));
 CREATE TABLE IF NOT EXISTS dms(id SERIAL PRIMARY KEY, user_id INT, account_id INT, from_user BOOLEAN, text TEXT, created_at TIMESTAMPTZ DEFAULT now());
 CREATE INDEX IF NOT EXISTS dms_conv ON dms(user_id, account_id, created_at);

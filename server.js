@@ -46,16 +46,18 @@ const POST_SELECT = (uid) => `
   SELECT p.id, p.text, p.created_at, p.likes_target, p.reposts_target, p.replies_target, p.views_target, p.tau, p.parent_id, p.quote_of, p.viral,
     (SELECT count(*) FROM posts c WHERE c.parent_id=p.id AND c.created_at<=now()) AS real_replies,
     ${uid ? `EXISTS(SELECT 1 FROM likes l WHERE l.post_id=p.id AND l.user_id=${Number(uid)}) AS liked,
-    EXISTS(SELECT 1 FROM reposts r WHERE r.post_id=p.id AND r.user_id=${Number(uid)}) AS reposted,` : 'false AS liked, false AS reposted,'}
+    EXISTS(SELECT 1 FROM reposts r WHERE r.post_id=p.id AND r.user_id=${Number(uid)}) AS reposted,
+    EXISTS(SELECT 1 FROM bookmarks b WHERE b.post_id=p.id AND b.user_id=${Number(uid)}) AS bookmarked,` : 'false AS liked, false AS reposted, false AS bookmarked,'}
+    (SELECT a2.handle FROM posts pp JOIN accounts a2 ON a2.id=pp.author_id WHERE pp.id=p.parent_id) AS reply_to,
     ${A_COLS}
   FROM posts p JOIN accounts a ON a.id=p.author_id`;
 // the SELECT returns both p.id and a.id as "id"; alias safely instead:
-const POSTS_SQL = (uid) => POST_SELECT(uid).replace('SELECT p.id,', 'SELECT p.id AS pid, p.author_id,').replace(A_COLS, A_COLS.replace('a.id,', ''));
+const POSTS_SQL = (uid) => POST_SELECT(uid).replace('SELECT p.id,', 'SELECT p.id AS pid, p.author_id,').replace(A_COLS, A_COLS.replace('a.id,', '').replace(', a.created_at', ''));
 function shape(r, uid) {
   return {
     id: r.pid, text: r.text, created: new Date(r.created_at).getTime(), tau: r.tau, parent_id: r.parent_id, quote_of: r.quote_of, viral: r.viral,
     likes_t: Number(r.likes_target), reposts_t: Number(r.reposts_target), replies_t: Number(r.replies_target), views_t: Number(r.views_target),
-    real_replies: Number(r.real_replies), liked: r.liked, reposted: r.reposted, mine: r.author_id === uid,
+    real_replies: Number(r.real_replies), liked: r.liked, reposted: r.reposted, bookmarked: r.bookmarked, reply_to: r.reply_to, mine: r.author_id === uid,
     author: { id: r.author_id, handle: r.handle, name: r.name, bio: r.bio, followers: Number(r.followers), verified: r.verified, kind: r.kind, pfp: r.pfp },
   };
 }
@@ -283,6 +285,31 @@ app.post('/api/repost/:id', auth, wrap(async (req, res) => {
   res.json({ reposted: !had });
 }));
 
+// ---------------- bookmarks / delete / edit profile ----------------
+app.post('/api/bookmark/:id', auth, wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const had = await q1('DELETE FROM bookmarks WHERE user_id=$1 AND post_id=$2 RETURNING 1', [req.user.id, id]);
+  if (!had) await q('INSERT INTO bookmarks(user_id,post_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [req.user.id, id]);
+  res.json({ bookmarked: !had });
+}));
+app.get('/api/bookmarks', auth, wrap(async (req, res) => {
+  res.json(await loadPosts(`p.id IN (SELECT post_id FROM bookmarks WHERE user_id=$1) AND p.created_at<=now()`, [req.user.id], req.user.id, 'ORDER BY p.created_at DESC LIMIT 100'));
+}));
+app.delete('/api/post/:id', auth, wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const mine = await q1('SELECT 1 FROM posts WHERE id=$1 AND author_id=$2', [id, req.user.id]);
+  if (!mine) return res.status(403).json({ error: 'You can only delete your own posts' });
+  await q('DELETE FROM posts WHERE parent_id=$1 OR id=$1', [id]);
+  await q('DELETE FROM likes WHERE post_id=$1; ', [id]).catch(() => { });
+  res.json({ ok: true });
+}));
+app.patch('/api/me', auth, wrap(async (req, res) => {
+  const name = String(req.body.name ?? req.user.name).trim().slice(0, 30) || req.user.name;
+  const bio = String(req.body.bio ?? req.user.bio ?? '').slice(0, 160);
+  await q('UPDATE accounts SET name=$2, bio=$3 WHERE id=$1', [req.user.id, name, bio]);
+  res.json({ ok: true, name, bio });
+}));
+
 // ---------------- profiles/follow ----------------
 app.get('/api/profile/:handle', auth, wrap(async (req, res) => {
   const a = await q1('SELECT * FROM accounts WHERE lower(handle)=lower($1)', [req.params.handle]);
@@ -290,7 +317,7 @@ app.get('/api/profile/:handle', auth, wrap(async (req, res) => {
   if (a.id === req.user.id) await userFollowers(a);
   const tab = req.query.tab || 'posts';
   const where = tab === 'replies' ? `p.author_id=$1 AND p.parent_id IS NOT NULL AND p.created_at<=now()`
-    : tab === 'likes' ? `p.id IN (SELECT post_id FROM likes WHERE user_id=$1)` : `p.author_id=$1 AND p.parent_id IS NULL AND p.created_at<=now()`;
+    : tab === 'likes' ? `p.id IN (SELECT post_id FROM likes WHERE user_id=$1)` : tab === 'media' ? `false AND $1::int > 0` : `p.author_id=$1 AND p.parent_id IS NULL AND p.created_at<=now()`;
   const posts = await loadPosts(where, [a.id], req.user.id, 'ORDER BY p.created_at DESC LIMIT 40');
   const f = await q1('SELECT EXISTS(SELECT 1 FROM follows WHERE user_id=$1 AND account_id=$2) AS f', [req.user.id, a.id]);
   const fc = await q1('SELECT count(*) c FROM follows WHERE user_id=$1', [a.id]);
@@ -491,6 +518,7 @@ async function loadKV() {
 app.use((req, res, next) => { if (req.path.startsWith('/api/') && req.get('x-token')) lastActive = Date.now(); next(); });
 
 async function seedAccounts() {
+  const joinDates = () => q(`UPDATE accounts SET created_at = timestamp '2009-02-01' + ((abs(hashtext(handle)) % 2900) || ' days')::interval WHERE kind IN ('celeb','commentary','news') AND created_at > now() - interval '30 days'`);
   // @ye was Ye's old handle in earlier builds; his X handle is @kanyewest
   await q(`UPDATE accounts SET handle='kanyewest' WHERE handle='ye' AND kind='celeb' AND NOT EXISTS (SELECT 1 FROM accounts WHERE handle='kanyewest')`);
   for (const a of ACCOUNTS) {
@@ -500,6 +528,7 @@ async function seedAccounts() {
         ppd=CASE WHEN accounts.tuned THEN accounts.ppd ELSE $12 END, rpd=CASE WHEN accounts.tuned THEN accounts.rpd ELSE $13 END`,
       [a.handle, a.name, a.bio, a.followers, Math.floor(rnd(0, 1500)), a.v, a.kind, a.pfp, a.voice, a.ppd, a.topics, a.ppd, a.rpd]);
   }
+  await joinDates(); // realistic "Joined" dates for the cast (2009–2016)
 }
 const stoch = x => Math.floor(x) + (Math.random() < x - Math.floor(x) ? 1 : 0);
 const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));

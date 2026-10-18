@@ -65,19 +65,27 @@ async function genProfile({ name, handle, bio, followers, posts, likes }) {
 const card = a => `### @${a.handle} — ${a.name} (${a.kind} account${a.followers ? ', ' + Math.round(a.followers / 1e5) / 10 + 'M followers' : ''})
 Voice & formatting: ${a.voice}
 Talks about: ${a.topics || 'whatever fits the account'}
-Style samples (imitate the STYLE, never copy the content): ${(a.ex || []).map(e => JSON.stringify(e)).join(' | ')}`;
-const RULES = `Rules: every post must be unmistakably in its author's own voice (word choice, punctuation, caps, emoji habits, length, formatting). Be specific and fresh: concrete names, numbers, places, details. No generic filler like "Big things coming". Vary length and format across posts. No hashtags unless the persona uses them. Max 270 characters each. Posts about real people must be harmless and obviously silly/fictional.`;
+Style samples — reference ONLY for style; NEVER reuse their wording, topics or specifics in new posts: ${(a.ex || []).map(e => JSON.stringify(e)).join(' | ')}`;
+const RULES = `Rules: every post must be unmistakably in its author's own voice (word choice, punctuation, caps, emoji habits, length, formatting). Be specific and fresh: concrete names, numbers, places, details. No generic filler like "Big things coming". Every post must be clearly different from the others (different topic and different template). Vary length and format across posts. No hashtags unless the persona uses them. Max 270 characters each. Posts about real people must be harmless and obviously silly/fictional.`;
 // reqs: [{a, n, recent: [texts], span}] -> { [handleLower]: [text,...] } (oldest -> newest)
-async function genPostsBatch(reqs, { when = 'right now' } = {}) {
-  const blocks = reqs.map(r => `${card(r.a)}\nPosts needed: ${r.n}${r.n > 1 ? ` (oldest to newest, spread across ${r.span || when})` : ` (as of ${when})`}${r.recent && r.recent.length ? `\nTheir recent posts (do NOT repeat, but you may continue storylines): ${r.recent.slice(0, 5).map(t => JSON.stringify(t.slice(0, 120))).join(' | ')}` : ''}`).join('\n\n');
+async function genPostsBatch(reqs, { when = 'right now', noRetry = false } = {}) {
+  const blocks = reqs.map(r => `${card(r.a)}\nPosts needed: ${r.n}${r.n > 1 ? ` (oldest to newest, spread across ${r.span || when})` : ` (as of ${when})`}${r.recent && r.recent.length ? `\nTheir recent posts (do NOT repeat or rephrase these; you may continue storylines): ${r.recent.slice(0, 5).map(t => JSON.stringify(t.slice(0, 120))).join(' | ')}` : ''}`).join('\n\n');
   const j = await askJSON(`You ghostwrite posts for accounts on Z, a parody social network. Below are persona cards.\n\n${blocks}\n\n${RULES}\nReturn ONE JSON object mapping each handle (no @) to an array of post strings: {"handle":["post",...]}`, Math.min(7000, 600 + reqs.reduce((t, r) => t + r.n, 0) * 140));
-  const out = {};
+  const out = {}, redo = [];
+  const norm = t => String(t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
   for (const r of reqs) {
     const key = Object.keys(j || {}).find(k => k.replace(/^@/, '').toLowerCase() === r.a.handle.toLowerCase());
-    let arr = key && Array.isArray(j[key]) ? j[key].map(x => (typeof x === 'string' ? x : x && x.text)).filter(Boolean) : [];
-    while (arr.length < r.n) arr.push(fbPost(r.a).text);
+    const raw = key && Array.isArray(j[key]) ? j[key].map(x => (typeof x === 'string' ? x : x && x.text)).filter(Boolean) : [];
+    const seen = new Set([...(r.recent || []), ...(r.a.ex || [])].map(norm)), arr = [];
+    for (const t of raw) { const n = norm(t); if (n && !seen.has(n)) { seen.add(n); arr.push(t); } } // drop repeats
     out[r.a.handle.toLowerCase()] = arr.slice(0, r.n);
+    if (arr.length < r.n) redo.push({ ...r, n: r.n - arr.length, recent: [...arr, ...(r.recent || [])] });
   }
+  if (redo.length && j && !noRetry) { // one retry for the missing/duplicate ones, then canned text as a last resort
+    const again = await genPostsBatch(redo, { when, noRetry: true });
+    for (const r of redo) out[r.a.handle.toLowerCase()].push(...again[r.a.handle.toLowerCase()]);
+  }
+  for (const r of reqs) { const arr = out[r.a.handle.toLowerCase()]; while (arr.length < r.n) arr.push(fbPost(r.a).text); out[r.a.handle.toLowerCase()] = arr.slice(0, r.n); }
   return out;
 }
 async function genPosts(accts) { // single post each (live ticks)
