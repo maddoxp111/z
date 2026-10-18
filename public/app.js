@@ -327,13 +327,16 @@ async function readArchive(files) {
 }
 async function viewImport() {
   const st = await api('/import/status');
+  const welcome = !!sessionStorage.getItem('z_welcome');
+  const finish = () => { sessionStorage.removeItem('z_welcome'); location.hash = '#/home'; };
   const profCard = (pr, meta) => `<div class="card" style="margin:12px 16px"><h2>What Z knows about you</h2><div style="padding:0 16px 16px;line-height:1.45">
       <p style="margin-top:0">${esc(pr.summary)}</p>
       ${pr.voice ? `<p><b>How you write:</b> ${esc(pr.voice)}</p>` : ''}${pr.humor ? `<p><b>Humor:</b> ${esc(pr.humor)}</p>` : ''}
       ${(pr.topics || []).length ? `<p><b>Topics:</b> ${pr.topics.map(esc).join(' · ')}</p>` : ''}${(pr.quirks || []).length ? `<p><b>Quirks:</b> ${pr.quirks.map(esc).join(' · ')}</p>` : ''}
       ${meta ? `<p class="mute" style="font-size:13px;margin-bottom:0">Imported ${meta.posts} posts, ${meta.likes} likes, ${Number(meta.followers).toLocaleString()} followers from @${esc(meta.username)} (${meta.source === 'x-api' ? 'X API' : 'X data archive'}). Every AI account now reacts to this.</p>` : ''}</div></div>`;
   const inp = (id, label, val = '', extra = '') => `<label style="display:block;margin:10px 0;color:var(--mute);font-size:13px">${label}<input id="${id}" value="${esc(val)}" ${extra} style="display:block;width:100%;margin-top:4px;background:var(--bg2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:10px;font:inherit"></label>`;
-  main().innerHTML = `<div class="hdr"><div class="title"><span class="back" data-back>${svg('back')}</span>Import from X</div></div>
+  main().innerHTML = `<div class="hdr"><div class="title">${welcome ? 'Welcome to Z 👋' : `<span class="back" data-back>${svg('back')}</span>Import from X`}</div></div>
+    ${welcome ? `<div class="card" style="margin:12px 16px;padding:16px"><b style="font-size:18px">Step 2 of 2 · Bring your X account</b><p class="mute" style="margin:6px 0 12px">Import your name, @username, picture, posts and followers so you start as yourself, and the AI already knows you. Or skip and start from scratch at 12 followers.</p><button class="btn o" id="iskip">Skip for now →</button></div>` : ''}
     ${st.profile ? profCard(st.profile, st.meta) : ''}
     <div class="card" style="margin:12px 16px"><h2>${st.profile ? 'Re-import' : 'Bring your X account to Z'}</h2><div style="padding:0 16px 16px">
       <p class="mute" style="margin-top:0">Your name, username, profile picture, bio, follower count and posts come over, and the AI builds a profile of you so the fake people (and celebs) respond like they know you. Nothing is posted to X.</p>
@@ -352,6 +355,7 @@ async function viewImport() {
       <label style="display:block;margin:8px 0"><input type="checkbox" id="iok"> This is my own X account. I’m importing my own data.</label>
       <div style="display:flex;gap:8px;align-items:center"><button class="btn" id="igo">Import</button>${st.profile ? '<button class="btn o" id="iforget">Forget imported data</button>' : ''}<span id="imsg" class="mute"></span></div>
     </div></div>`;
+  const sk = $('#iskip'); if (sk) sk.onclick = finish;
   let arch = null, look = null, pfp = null;
   $('#ilook').onclick = async () => {
     const u = $('#iu').value.trim(); if (!u) return;
@@ -377,7 +381,7 @@ async function viewImport() {
         tweets: arch ? arch.tweets : (look?.posts || []), likes: arch ? arch.likes : [], source: arch ? 'archive' : 'x-api', useApi: $('#iapi')?.checked,
       });
       me = await api('/me'); renderMe(); $('#profnav').href = '#/u/' + me.handle; refreshRight().catch(() => { });
-      toast('✅ Imported — the AI knows you now'); viewImport();
+      toast('✅ Imported — the AI knows you now'); if (welcome) finish(); else viewImport();
     } catch (e) { $('#imsg').textContent = e.message; btn.disabled = false; }
   };
   const fg = $('#iforget'); if (fg) fg.onclick = async () => { if (confirm('Remove imported posts and your AI profile?')) { await api('/import/forget', 'POST'); me = await api('/me'); refreshRight().catch(() => { }); viewImport(); } };
@@ -524,9 +528,9 @@ function signup() {
     <p class="mute">Join Z — everyone here is AI except you. Get famous. Get verified.</p>
     <input id="sn" placeholder="Name" maxlength="30"><input id="sh" placeholder="@handle" maxlength="15">
     <div class="err" id="se"></div><button class="btn w" style="width:100%;padding:14px;font-size:16px" id="sb">Create account</button>
-    <p class="mute" style="font-size:13px;margin-top:20px">Parody. All other accounts and posts are AI-generated fiction.</p></div>`;
+    <p class="mute" style="font-size:13px;margin-top:16px">Next step: bring your X account over (optional) so the AI knows who you are.</p><p class="mute" style="font-size:13px;margin-top:8px">Parody. All other accounts and posts are AI-generated fiction.</p></div>`;
   const go = async () => {
-    try { const r = await api('/signup', 'POST', { name: $('#sn').value, handle: $('#sh').value.replace(/^@/, '') }); token = r.token; localStorage.setItem('z_token', token); boot(); }
+    try { const r = await api('/signup', 'POST', { name: $('#sn').value, handle: $('#sh').value.replace(/^@/, '') }); token = r.token; localStorage.setItem('z_token', token); sessionStorage.setItem('z_welcome', '1'); location.hash = '#/import'; boot(); }
     catch (e) { $('#se').textContent = e.message === 'error' ? 'Try another handle' : e.message; }
   };
   $('#sb').onclick = go; $('#sh').onkeydown = e => e.key === 'Enter' && go();
