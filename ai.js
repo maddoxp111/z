@@ -1,5 +1,16 @@
 // Haiku 5.5 content generation, with offline fallbacks so Z still works without a key.
+const { AsyncLocalStorage } = require('async_hooks');
 const KEY = process.env.ANTHROPIC_API_KEY;
+const als = new AsyncLocalStorage();
+// token usage since last drain (server persists it per day); price: Haiku 5.5 = $0.10 / $0.50 per 1M in/out tokens
+let usage = { calls: 0, in: 0, out: 0, byKind: {} };
+function drainUsage() { const u = usage; usage = { calls: 0, in: 0, out: 0, byKind: {} }; return u; }
+function track(j) {
+  const k = als.getStore() || 'other', u = j.usage || {};
+  const i = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0), o = u.output_tokens || 0;
+  usage.calls++; usage.in += i; usage.out += o;
+  const b = (usage.byKind[k] ||= { calls: 0, in: 0, out: 0 }); b.calls++; b.in += i; b.out += o;
+}
 const MODEL = process.env.Z_MODEL || 'claude-haiku-5-5';
 const BASE = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
 
@@ -14,7 +25,7 @@ async function ask(prompt, max = 1800, system = SAFETY) {
       body: JSON.stringify({ model: MODEL, max_tokens: max, thinking: { type: 'disabled' }, system, messages: [{ role: 'user', content: prompt }] }),
     });
     if (!r.ok) { console.error('[ai]', r.status, (await r.text()).slice(0, 200)); return null; }
-    const j = await r.json();
+    const j = await r.json(); track(j);
     return (j.content || []).map(c => c.text || '').join('');
   } catch (e) { console.error('[ai] fail', e.message); return null; }
 }
@@ -116,4 +127,6 @@ async function genTrends() {
     { cat: 'Trending in Music', topic: '#ZAlbumFriday', posts: '184K' }, { cat: 'Sports · Trending', topic: 'Game 7', posts: '92.3K' },
     { cat: 'Entertainment · Trending', topic: 'Surprise drop', posts: '51.2K' }, { cat: 'Trending', topic: 'Benches', posts: '12.4K' }, { cat: 'Politics · Trending', topic: 'Inbox Zero', posts: '8,311' }];
 }
-module.exports = { genProfile, blurb, genPostsBatch, genAccountReplies, card, genPosts, genReplies, genUserReplies, genCelebReply, genDMReply, genIncomingDM, genTrends, hasKey: !!KEY, MODEL };
+const gens = { genProfile, genPostsBatch, genAccountReplies, genPosts, genReplies, genUserReplies, genCelebReply, genDMReply, genIncomingDM, genTrends };
+const wrapped = Object.fromEntries(Object.entries(gens).map(([k, f]) => [k, (...args) => als.run(k.replace(/^gen/, '').replace(/^./, c => c.toLowerCase()), () => f(...args))]));
+module.exports = { ...wrapped, drainUsage, blurb, card, hasKey: !!KEY, MODEL };

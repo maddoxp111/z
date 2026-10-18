@@ -64,6 +64,7 @@ function linkify(t) {
 const hue = s => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
 function av(a, cls = '') {
   const init = esc((a.name || a.handle || '?').trim()[0] || '?').toUpperCase();
+  cls += a.verified === 'gold' ? ' sq' : ''; // gold-check organisations get square avatars, like on X
   const fb = `<div class="av ${cls}" style="background:hsl(${hue(a.handle)},45%,35%)">${init}</div>`;
   if (!a.pfp) return fb;
   return `<img class="av ${cls}" src="${esc(a.pfp)}" loading="lazy" alt="" referrerpolicy="no-referrer" onerror="this.outerHTML=this.dataset.fb" data-fb="${esc(fb)}">`;
@@ -285,27 +286,43 @@ async function viewMessages(handle) {
 let chatTimer;
 async function viewChat(handle) {
   main().innerHTML = '<div class="empty">Loading…</div>';
+  let awaiting = 0, theirCount = null, seen = false, busy = false; // awaiting = until-when we show the typing bubble
   const draw = async (first) => {
-    if (!location.hash.startsWith('#/messages/')) return;
-    const r = await api('/dms/' + handle);
-    const a = r.account;
-    const last = r.messages[r.messages.length - 1];
-    if (first) main().innerHTML = `<div class="hdr"><div class="title"><span class="back" data-back>${svg('back')}</span>${av(a, 's')}<div style="line-height:1.2">${nameLine(a)}<div class="mute" style="font-size:13px;font-weight:400">@${esc(a.handle)}</div></div></div></div><div class="chat"><div class="msgs" id="msgs"></div><div class="chatin"><input id="mi" placeholder="Start a new message" autocomplete="off"><button class="btn" id="ms">Send</button></div></div>`;
-    const box = $('#msgs'); if (!box) return;
-    const atBottom = first || box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    const sig = r.messages.map(m => m.id).join();
-    if (box.dataset.sig !== sig) {
-      box.dataset.sig = sig;
-      box.innerHTML = (r.messages.map(m => `<div class="m ${m.from_user ? 'me2' : 'th'}">${esc(m.text)}</div>`).join('') || `<div class="empty">No messages yet. Say something to @${esc(a.handle)}.</div>`) + (last && last.from_user ? `<div class="mute" style="align-self:flex-end;font-size:13px">${Date.now() - last.created > 25000 ? 'Delivered' : 'Sent'}</div>` : '');
-      if (atBottom) box.scrollTop = box.scrollHeight;
-    }
-    if (first) {
-      const send = async () => { const i = $('#mi'); const t = i.value.trim(); if (!t) return; i.value = ''; await api('/dms/' + handle, 'POST', { text: t }); draw(); };
-      $('#ms').onclick = send; $('#mi').onkeydown = e => { if (e.key === 'Enter') send(); }; $('#mi').focus();
-    }
+    if (!location.hash.startsWith('#/messages/') || busy) return; busy = true;
+    try {
+      const r = await api('/dms/' + handle);
+      const a = r.account;
+      const theirs = r.messages.filter(m => !m.from_user).length;
+      if (theirCount === null) theirCount = theirs;
+      if (theirs > theirCount) { awaiting = 0; theirCount = theirs; seen = false; } // their message arrived
+      const last = r.messages[r.messages.length - 1];
+      const typing = Date.now() < awaiting || r.typing;
+      if (first) main().innerHTML = `<div class="hdr"><div class="title"><span class="back" data-back>${svg('back')}</span>${av(a, 's')}<div style="line-height:1.2">${nameLine(a)}<div class="mute" style="font-size:13px;font-weight:400" id="cstat">@${esc(a.handle)}</div></div></div></div><div class="chat"><div class="msgs" id="msgs"></div><div class="chatin"><input id="mi" placeholder="Start a new message" autocomplete="off"><button class="btn" id="ms">Send</button></div></div>`;
+      const box = $('#msgs'); if (!box) return;
+      const atBottom = first || box.scrollHeight - box.scrollTop - box.clientHeight < 90;
+      const sig = r.messages.map(m => m.id).join() + '|' + typing + '|' + seen;
+      if (box.dataset.sig !== sig) {
+        box.dataset.sig = sig;
+        const status = last && last.from_user && !typing ? `<div class="mute" style="align-self:flex-end;font-size:13px">${seen ? 'Seen' : Date.now() - last.created > 25000 ? 'Delivered' : 'Sent'}</div>` : '';
+        box.innerHTML = (r.messages.map(m => `<div class="m ${m.from_user ? 'me2' : 'th'}">${esc(m.text)}</div>`).join('') || `<div class="empty">No messages yet. Say something to @${esc(a.handle)}.</div>`) + status + (typing ? '<div class="m th typing"><i></i><i></i><i></i></div>' : '');
+        if (atBottom) box.scrollTop = box.scrollHeight;
+      }
+      const st = $('#cstat'); if (st) st.textContent = typing ? 'typing…' : '@' + a.handle;
+      if (first) {
+        const send = async () => {
+          const i = $('#mi'); const t = i.value.trim(); if (!t) return; i.value = '';
+          const res = await api('/dms/' + handle, 'POST', { text: t });
+          if (res.reply) awaiting = Date.now() + 30000; else setTimeout(() => { seen = true; draw(); }, 1800 + Math.random() * 2500); // read, no reply
+          draw();
+        };
+        $('#ms').onclick = send; $('#mi').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } }); $('#mi').focus();
+      }
+    } finally { busy = false; }
   };
   await draw(true);
-  clearInterval(chatTimer); chatTimer = setInterval(() => draw(false).catch(() => { }), 3000);
+  clearInterval(chatTimer);
+  const loop = () => { draw(false).catch(() => { }).finally(() => { chatTimer = setTimeout(loop, Date.now() < awaiting ? 800 : 3000); }); };
+  clearTimeout(chatTimer); chatTimer = setTimeout(loop, 1000);
   pollNow();
 }
 
@@ -410,6 +427,7 @@ async function viewSim() {
           <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">${field('s_post', 'Post speed ×', S.postMult)}${field('s_reply', 'Reply speed ×', S.replyMult)}${field('s_mpt', 'Max posts / tick', S.maxPerTick)}${field('s_mrt', 'Max replies / tick', S.maxRepliesPerTick)}</div>
           <div style="display:flex;gap:20px;margin-top:14px;flex-wrap:wrap"><label><input type="checkbox" id="s_pause" ${S.paused ? 'checked' : ''}> Pause AI accounts</label><label><input type="checkbox" id="s_idle" ${S.idlePause ? 'checked' : ''}> Auto-pause when nobody’s online (saves API credits)</label></div>
           <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-top:14px">${field('s_sb', 'Fast-forward: posts per run', S.simBudget, 10, 130)}${field('s_srb', 'Fast-forward: replies per run', S.simReplyBudget, 10, 130)}<button class="btn" id="s_save">Save</button></div></div></div>
+        <div class="card" style="margin:12px 16px"><h2>API usage <span class="mute" style="font-size:14px;font-weight:400">· estimated cost</span></h2><div id="usagebox" style="padding:0 16px 16px" class="mute">Loading…</div></div>
         <div class="card" style="margin:12px 16px"><h2>Cast <span class="mute" style="font-size:14px;font-weight:400">· per-account frequency</span></h2><div style="padding:0 16px 8px;display:flex;gap:8px"><input id="cfilter" placeholder="Filter accounts…" style="flex:1;background:var(--bg2);border:1px solid var(--line);border-radius:999px;color:var(--text);padding:8px 14px;font:inherit"><button class="btn o" id="creset">Reset all</button></div><div id="castlist"></div></div>`;
       $('#s_save').onclick = async () => { await api('/sim/settings', 'POST', { postMult: +$('#s_post').value, replyMult: +$('#s_reply').value, maxPerTick: +$('#s_mpt').value, maxRepliesPerTick: +$('#s_mrt').value, paused: $('#s_pause').checked, idlePause: $('#s_idle').checked, simBudget: +$('#s_sb').value, simReplyBudget: +$('#s_srb').value }); toast('Sim settings saved'); };
       box.querySelectorAll('[data-preset]').forEach(b => b.onclick = () => { $('#s_post').value = $('#s_reply').value = b.dataset.preset; $('#s_save').click(); });
@@ -417,6 +435,7 @@ async function viewSim() {
       $('#cfilter').oninput = drawCast;
       drawCast();
     }
+    drawUsage();
     $('#simlive').innerHTML = `<div class="card" style="margin:12px 16px"><div style="padding:16px">
         <div style="display:flex;justify-content:space-between;align-items:baseline"><div><span class="mute">World clock</span><div style="font-size:32px;font-weight:800">Day ${st.day + 1}</div></div>
         <div class="mute" style="text-align:right;font-size:13px">${st.stats.cast} accounts · ${st.stats.npcs} commenters · ${st.stats.posts.toLocaleString()} posts<br>${st.ai ? 'AI: ' + esc(st.model) : '<span style="color:var(--pink)">AI offline (no API key) — canned text</span>'}</div></div>
@@ -433,6 +452,12 @@ async function viewSim() {
     if (wasRunning && !st.running) { toast('⏩ Simulation step finished — check your feed'); api('/explore').catch(() => { }); refreshRight().catch(() => { }); }
     wasRunning = st.running;
   };
+  async function drawUsage() {
+    const u = await api('/sim/usage').catch(() => null), el = $('#usagebox'); if (!u || !el) return;
+    const money = v => '$' + (v < 0.1 ? v.toFixed(3) : v.toFixed(2)), M = n => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'K' : n;
+    el.innerHTML = u.days.length ? `<table style="width:100%;border-collapse:collapse;font-size:14px"><tr class="mute" style="text-align:right;font-size:12px"><td style="text-align:left">Day</td><td>Calls</td><td>Input</td><td>Output</td><td>≈ Cost</td></tr>${u.days.slice().reverse().map(d => `<tr style="text-align:right;border-top:1px solid var(--line);color:var(--text)"><td style="text-align:left;padding:6px 0">${d.date}</td><td>${d.calls.toLocaleString()}</td><td>${M(d.in)}</td><td>${M(d.out)}</td><td><b>${money(d.cost)}</b></td></tr>`).join('')}</table>
+      <div style="font-size:12px;margin-top:8px">${esc(u.price.model)} at $${u.price.in} / $${u.price.out} per 1M input / output tokens. Biggest spenders today: ${Object.entries(u.days[u.days.length - 1].byKind).sort((a, b) => (b[1].in * u.price.in + b[1].out * u.price.out) - (a[1].in * u.price.in + a[1].out * u.price.out)).slice(0, 3).map(([k, v]) => `${k} (${v.calls})`).join(', ')}.</div>` : 'No calls recorded yet.';
+  }
   function drawCast() {
     const f = ($('#cfilter')?.value || '').toLowerCase();
     $('#castlist').innerHTML = cast.filter(c => !f || c.handle.toLowerCase().includes(f) || c.name.toLowerCase().includes(f)).map(c => `<div class="who2" style="border-top:1px solid var(--line)">${av(c, 's')}<div class="info"><b>${esc(c.name)}${verified(c.verified)}${c.tuned ? ' <span class="mute" style="font-weight:400;font-size:12px">· edited</span>' : ''}</b><span class="mute">@${esc(c.handle)} · ${compact(c.followers)} · ${c.posts} posts</span></div>
@@ -452,7 +477,7 @@ async function viewSim() {
 // ---------- routing ----------
 async function route() {
   if (!me || !$('#main')) return; // shell not built yet (e.g. hashchange fired mid-signup)
-  clearInterval(chatTimer); clearTimeout(window._rt);
+  clearTimeout(chatTimer); clearInterval(chatTimer); clearTimeout(window._rt);
   const h = location.hash || '#/home';
   const [path, qs] = h.slice(1).split('?');
   const seg = path.split('/').filter(Boolean);

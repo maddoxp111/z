@@ -339,7 +339,8 @@ app.get('/api/dms/:handle', auth, wrap(async (req, res) => {
   const a = await q1('SELECT * FROM accounts WHERE lower(handle)=lower($1)', [req.params.handle]);
   if (!a) return res.status(404).json({ error: 'nf' });
   const msgs = await q(`SELECT id, from_user, text, created_at FROM dms WHERE user_id=$1 AND account_id=$2 AND created_at<=now() ORDER BY created_at`, [req.user.id, a.id]);
-  res.json({ account: pubAcct(a), messages: msgs.map(m => ({ ...m, created: new Date(m.created_at).getTime() })) });
+  const pend = await q1(`SELECT count(*) c FROM dms WHERE user_id=$1 AND account_id=$2 AND NOT from_user AND created_at>now()`, [req.user.id, a.id]);
+  res.json({ account: pubAcct(a), messages: msgs.map(m => ({ ...m, created: new Date(m.created_at).getTime() })), typing: Number(pend.c) > 0 });
 }));
 app.post('/api/dms/:handle', auth, wrap(async (req, res) => {
   const text = String(req.body.text || '').trim().slice(0, 1000);
@@ -350,15 +351,17 @@ app.post('/api/dms/:handle', auth, wrap(async (req, res) => {
   const ratio = fame / Math.max(1, Number(a.followers));
   // very famous accounts often just leave you on "delivered" until you're someone
   const ghost = ratio < 0.0005 ? 0.55 : ratio < 0.01 ? 0.25 : 0.05;
-  if (Math.random() >= ghost) {
+  const replying = Math.random() >= ghost;
+  if (replying) {
     const history = await q('SELECT from_user, text FROM dms WHERE user_id=$1 AND account_id=$2 ORDER BY created_at DESC LIMIT 10', [req.user.id, a.id]);
     history.reverse();
-    const acct = ACCOUNTS.find(x => x.handle.toLowerCase() === a.handle.toLowerCase()) || a;
+    const acct = withPersona({ ...a });
+    // the reply lands after a "typing" delay proportional to its length; the client shows the typing bubble meanwhile
     ai.genDMReply({ ...acct, followers: a.followers }, { history, userName: req.user.name, fame, ratio, profile: req.user.profile }).then(reply =>
-      q('INSERT INTO dms(user_id,account_id,from_user,text,created_at) VALUES($1,$2,false,$3,$4)', [req.user.id, a.id, reply, new Date(Date.now() + rnd(3, 20) * 1000)])
+      q('INSERT INTO dms(user_id,account_id,from_user,text,created_at) VALUES($1,$2,false,$3,$4)', [req.user.id, a.id, reply, new Date(Date.now() + Math.min(6000, Math.max(600, reply.length * 35)))])
     ).catch(e => console.error(e));
   }
-  res.json({ ok: true });
+  res.json({ ok: true, reply: replying });
 }));
 
 // incoming DMs + unread counts; client polls this
@@ -488,12 +491,14 @@ async function loadKV() {
 app.use((req, res, next) => { if (req.path.startsWith('/api/') && req.get('x-token')) lastActive = Date.now(); next(); });
 
 async function seedAccounts() {
+  // @ye was Ye's old handle in earlier builds; his X handle is @kanyewest
+  await q(`UPDATE accounts SET handle='kanyewest' WHERE handle='ye' AND kind='celeb' AND NOT EXISTS (SELECT 1 FROM accounts WHERE handle='kanyewest')`);
   for (const a of ACCOUNTS) {
     await q(`INSERT INTO accounts(handle,name,bio,followers,following,verified,kind,pfp,voice,activity,topics,ppd,rpd)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       ON CONFLICT (handle) DO UPDATE SET name=$2, bio=$3, verified=$6, kind=$7, pfp=$8, voice=$9, topics=$11,
         ppd=CASE WHEN accounts.tuned THEN accounts.ppd ELSE $12 END, rpd=CASE WHEN accounts.tuned THEN accounts.rpd ELSE $13 END`,
-      [a.handle, a.name, a.bio, a.followers, Math.floor(rnd(0, 1500)), a.v, a.kind, `https://unavatar.io/x/${a.handle}`, a.voice, a.ppd, a.topics, a.ppd, a.rpd]);
+      [a.handle, a.name, a.bio, a.followers, Math.floor(rnd(0, 1500)), a.v, a.kind, a.pfp, a.voice, a.ppd, a.topics, a.ppd, a.rpd]);
   }
 }
 const stoch = x => Math.floor(x) + (Math.random() < x - Math.floor(x) ? 1 : 0);
@@ -699,6 +704,26 @@ app.post('/api/sim/cast/:handle', auth, wrap(async (req, res) => {
 }));
 app.post('/api/sim/cast-reset', auth, wrap(async (req, res) => { await q(`UPDATE accounts SET tuned=false WHERE kind IN ('celeb','commentary','news')`); await seedAccounts(); res.json({ ok: true }); }));
 
+// ---- API usage accounting (tokens per day, persisted) ----
+const PRICE_IN = 0.10, PRICE_OUT = 0.50; // claude-haiku-5-5, $ per 1M tokens (prompts <= 100K)
+let usageDays = {};
+const today = () => new Date().toISOString().slice(0, 10);
+async function flushUsage() {
+  const d = ai.drainUsage(); if (!d.calls) return;
+  const day = (usageDays[today()] ||= { calls: 0, in: 0, out: 0, byKind: {} });
+  day.calls += d.calls; day.in += d.in; day.out += d.out;
+  for (const [k, v] of Object.entries(d.byKind)) { const b = (day.byKind[k] ||= { calls: 0, in: 0, out: 0 }); b.calls += v.calls; b.in += v.in; b.out += v.out; }
+  const keep = Object.keys(usageDays).sort().slice(-14); usageDays = Object.fromEntries(keep.map(k => [k, usageDays[k]]));
+  await saveKV('usage', usageDays);
+}
+setInterval(() => flushUsage().catch(e => console.error('usage', e)), 20000);
+const cost = u => (u.in * PRICE_IN + u.out * PRICE_OUT) / 1e6;
+app.get('/api/sim/usage', auth, wrap(async (req, res) => {
+  await flushUsage();
+  const days = Object.entries(usageDays).sort().slice(-7).map(([date, u]) => ({ date, ...u, cost: cost(u) }));
+  res.json({ days, price: { in: PRICE_IN, out: PRICE_OUT, model: ai.MODEL } });
+}));
+
 let seeding = false;
 async function bootstrap() {
   seeding = true;
@@ -719,6 +744,7 @@ async function bootstrap() {
 const PORT = process.env.PORT || 3000;
 init().then(async () => {
   await loadKV();
+  { const u = await q1(`SELECT v FROM kv WHERE k='usage'`); if (u) usageDays = u.v; }
   app.listen(PORT, () => console.log(`[z] listening on ${PORT} · ai=${ai.hasKey ? ai.MODEL : 'OFFLINE FALLBACK (set ANTHROPIC_API_KEY)'} · ${ACCOUNTS.length} accounts`));
   bootstrap().catch(e => console.error('bootstrap', e));
   setInterval(() => tick().catch(e => console.error('tick', e)), TICK_MS);
