@@ -132,13 +132,17 @@ async function insertFutureReplies(parent, items, maxDelaySec) {
 
 // ---------------- auth/user ----------------
 app.post('/api/signup', wrap(async (req, res) => {
-  let { name, handle } = req.body;
+  let { name, handle, pfp, bio, followers } = req.body;
   name = String(name || '').trim().slice(0, 30);
-  handle = String(handle || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 15);
-  if (!name || handle.length < 3) return res.status(400).json({ error: 'Name and a handle (3+ letters/numbers) required' });
+  handle = String(handle || '').replace(/^@/, '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 15);
+  if (!name || handle.length < 1) return res.status(400).json({ error: 'Name and a handle are required' });
+  pfp = typeof pfp === 'string' && /^https:\/\/[\w.-]+\//.test(pfp) ? pfp.slice(0, 300) : null;
+  bio = String(bio || '').slice(0, 160);
+  const fol = Math.max(0, Math.min(1e9, Math.floor(Number(followers) || 0)));
   const token = crypto.randomBytes(24).toString('hex');
-  const row = await q1(`INSERT INTO accounts(handle,name,kind,followers,following,token,voice) VALUES($1,$2,'user',$3,0,$4,'') ON CONFLICT (handle) DO NOTHING RETURNING *`, [handle, name, START_FOLLOWERS, token]);
-  if (!row) return res.status(409).json({ error: 'That handle is taken' });
+  const row = await q1(`INSERT INTO accounts(handle,name,bio,kind,followers,following,token,voice,pfp,bonus_followers) VALUES($1,$2,$3,'user',$4,0,$5,'',$6,$7) ON CONFLICT (handle) DO NOTHING RETURNING *`,
+    [handle, name, bio, START_FOLLOWERS + Math.max(0, fol - START_FOLLOWERS), token, pfp, Math.max(0, fol - START_FOLLOWERS)]);
+  if (!row) return res.status(409).json({ error: `@${handle} is already taken on Z (built-in accounts and other players can't be reused)` });
   res.json({ token, user: pubAcct(row) });
 }));
 
@@ -407,6 +411,16 @@ async function lookupX(username) {
   } catch (e) { out.postsError = e.message; }
   return out;
 }
+// public (pre-signup) lookup of an X username, lightly rate-limited because it can spend X API quota
+const lookHits = new Map();
+app.post('/api/lookup', wrap(async (req, res) => {
+  const now = Date.now(), ip = req.ip, hits = (lookHits.get(ip) || []).filter(t => now - t < 3600e3);
+  if (hits.length >= 30) return res.status(429).json({ error: 'Too many lookups, try again later' });
+  lookHits.set(ip, [...hits, now]);
+  const username = String(req.body.username || '').replace(/^@/, '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 15);
+  if (!username) return res.status(400).json({ error: 'Enter an X username' });
+  try { const r = await lookupX(username); delete r.posts; res.json(r); } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+}));
 app.get('/api/import/status', auth, wrap(async (req, res) => {
   res.json({ profile: req.user.profile || null, meta: req.user.import_meta || null, xApi: !!X_TOKEN, handle: req.user.handle });
 }));

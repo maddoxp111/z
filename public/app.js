@@ -327,7 +327,7 @@ async function readArchive(files) {
 }
 async function viewImport() {
   const st = await api('/import/status');
-  const welcome = !!sessionStorage.getItem('z_welcome');
+  const welcomeKind = sessionStorage.getItem('z_welcome'), welcome = !!welcomeKind;
   const finish = () => { sessionStorage.removeItem('z_welcome'); location.hash = '#/home'; };
   const profCard = (pr, meta) => `<div class="card" style="margin:12px 16px"><h2>What Z knows about you</h2><div style="padding:0 16px 16px;line-height:1.45">
       <p style="margin-top:0">${esc(pr.summary)}</p>
@@ -336,12 +336,12 @@ async function viewImport() {
       ${meta ? `<p class="mute" style="font-size:13px;margin-bottom:0">Imported ${meta.posts} posts, ${meta.likes} likes, ${Number(meta.followers).toLocaleString()} followers from @${esc(meta.username)} (${meta.source === 'x-api' ? 'X API' : 'X data archive'}). Every AI account now reacts to this.</p>` : ''}</div></div>`;
   const inp = (id, label, val = '', extra = '') => `<label style="display:block;margin:10px 0;color:var(--mute);font-size:13px">${label}<input id="${id}" value="${esc(val)}" ${extra} style="display:block;width:100%;margin-top:4px;background:var(--bg2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:10px;font:inherit"></label>`;
   main().innerHTML = `<div class="hdr"><div class="title">${welcome ? 'Welcome to Z 👋' : `<span class="back" data-back>${svg('back')}</span>Import from X`}</div></div>
-    ${welcome ? `<div class="card" style="margin:12px 16px;padding:16px"><b style="font-size:18px">Step 2 of 2 · Bring your X account</b><p class="mute" style="margin:6px 0 12px">Import your name, @username, picture, posts and followers so you start as yourself, and the AI already knows you. Or skip and start from scratch at 12 followers.</p><button class="btn o" id="iskip">Skip for now →</button></div>` : ''}
+    ${welcome ? `<div class="card" style="margin:12px 16px;padding:16px"><b style="font-size:18px">${welcomeKind === 'x' ? 'You’re in as @' + esc(me.handle) + ' 🎉 · Step 2: add your posts' : 'Step 2 of 2 · Bring your X account'}</b><p class="mute" style="margin:6px 0 12px">${welcomeKind === 'x' ? 'Your handle, name and picture are set. Add your X archive to bring over your posts, likes and followers so the AI already knows you — or skip.' : 'Import your name, @username, picture, posts and followers so you start as yourself, and the AI already knows who you are. Or skip and start from scratch at 12 followers.'}</p><button class="btn o" id="iskip">Skip for now →</button></div>` : ''}
     ${st.profile ? profCard(st.profile, st.meta) : ''}
     <div class="card" style="margin:12px 16px"><h2>${st.profile ? 'Re-import' : 'Bring your X account to Z'}</h2><div style="padding:0 16px 16px">
       <p class="mute" style="margin-top:0">Your name, username, profile picture, bio, follower count and posts come over, and the AI builds a profile of you so the fake people (and celebs) respond like they know you. Nothing is posted to X.</p>
       <b>1 · Username</b>
-      <div style="display:flex;gap:8px;margin:8px 0"><input id="iu" placeholder="@yourusername" value="${esc(st.meta?.username || '')}" style="flex:1;background:var(--bg2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:10px;font:inherit"><button class="btn" id="ilook">Look up</button></div>
+      <div style="display:flex;gap:8px;margin:8px 0"><input id="iu" placeholder="@yourusername" value="${esc(st.meta?.username || (welcomeKind === 'x' ? me.handle : ''))}" style="flex:1;background:var(--bg2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:10px;font:inherit"><button class="btn" id="ilook">Look up</button></div>
       <div id="iprev" class="mute" style="font-size:13px">${st.xApi ? 'X API connected — public profile and recent posts can be fetched by username.' : 'Without an X API token Z can only fetch your profile picture by username. Add the archive below for everything else.'}</div>
       <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
       <b>2 · Your X archive <span class="mute" style="font-weight:400">(recommended — gets posts, likes &amp; followers)</span></b>
@@ -451,6 +451,7 @@ async function viewSim() {
 
 // ---------- routing ----------
 async function route() {
+  if (!me || !$('#main')) return; // shell not built yet (e.g. hashchange fired mid-signup)
   clearInterval(chatTimer); clearTimeout(window._rt);
   const h = location.hash || '#/home';
   const [path, qs] = h.slice(1).split('?');
@@ -524,16 +525,38 @@ async function pollNow() {
 
 // ---------- boot ----------
 function signup() {
-  $('#app').innerHTML = `<div class="signup"><div style="color:#fff">${svg('logo').replace('<svg', '<svg style="width:56px;height:56px"')}</div><h1>See what’s happening</h1>
+  let mode = 'new', look = null;
+  const render = () => {
+    $('#app').innerHTML = `<div class="signup"><div style="color:#fff">${svg('logo').replace('<svg', '<svg style="width:56px;height:56px"')}</div><h1>See what’s happening</h1>
     <p class="mute">Join Z — everyone here is AI except you. Get famous. Get verified.</p>
-    <input id="sn" placeholder="Name" maxlength="30"><input id="sh" placeholder="@handle" maxlength="15">
-    <div class="err" id="se"></div><button class="btn w" style="width:100%;padding:14px;font-size:16px" id="sb">Create account</button>
-    <p class="mute" style="font-size:13px;margin-top:16px">Next step: bring your X account over (optional) so the AI knows who you are.</p><p class="mute" style="font-size:13px;margin-top:8px">Parody. All other accounts and posts are AI-generated fiction.</p></div>`;
-  const go = async () => {
-    try { const r = await api('/signup', 'POST', { name: $('#sn').value, handle: $('#sh').value.replace(/^@/, '') }); token = r.token; localStorage.setItem('z_token', token); sessionStorage.setItem('z_welcome', '1'); location.hash = '#/import'; boot(); }
-    catch (e) { $('#se').textContent = e.message === 'error' ? 'Try another handle' : e.message; }
+    <div class="tabs" style="margin:8px 0 12px;border-bottom:1px solid var(--line)"><a id="tnew" class="${mode === 'new' ? 'on' : ''}">New account</a><a id="tx" class="${mode === 'x' ? 'on' : ''}">Use my X account</a></div>
+    ${mode === 'new' ? `<input id="sn" placeholder="Name" maxlength="30" autocomplete="off"><input id="sh" placeholder="@handle" maxlength="16" autocomplete="off" autocapitalize="off">`
+      : `<p class="mute" style="font-size:14px;margin:4px 0 8px;text-align:left">Enter your X username. Z uses your <b>handle</b>, <b>name</b> and <b>profile picture</b>. Next you can add your X archive for your posts, likes &amp; followers.</p>
+         <div style="display:flex;gap:8px"><input id="sx" placeholder="@yourXusername" maxlength="16" autocomplete="off" autocapitalize="off" value="${esc(look?.username || '')}"><button class="btn" id="slook" style="margin:8px 0;white-space:nowrap">Look up</button></div>
+         ${look ? `<div style="display:flex;gap:12px;align-items:center;text-align:left;margin:8px 0">${av({ name: look.name || look.username, handle: look.username, pfp: look.pfp })}<div style="flex:1"><div class="mute" style="font-size:13px">@${esc(look.username)}${look.followers != null ? ' · ' + look.followers.toLocaleString() + ' followers' : ''}</div></div></div>
+         <input id="sn" placeholder="Your display name" maxlength="30" value="${esc(look.name || '')}" autocomplete="off">${look.name ? '' : '<div class="mute" style="font-size:12px;text-align:left">Z can’t read display names without an X API token — type yours.</div>'}` : ''}`}
+    <div class="err" id="se"></div><button class="btn w" style="width:100%;padding:14px;font-size:16px" id="sb" ${mode === 'x' && !look ? 'disabled' : ''}>${mode === 'x' ? 'Create account with my X identity' : 'Create account'}</button>
+    <p class="mute" style="font-size:13px;margin-top:16px">Parody. All other accounts and posts are AI-generated fiction.</p></div>`;
+    $('#tnew').onclick = () => { mode = 'new'; render(); }; $('#tx').onclick = () => { mode = 'x'; render(); };
+    const err = m => $('#se').textContent = m;
+    const create = async () => {
+      const body = mode === 'x'
+        ? { name: $('#sn')?.value, handle: look?.username, pfp: look?.pfp, bio: look?.bio, followers: look?.followers }
+        : { name: $('#sn').value, handle: $('#sh').value.replace(/^@/, '') };
+      try { const r = await api('/signup', 'POST', body); token = r.token; localStorage.setItem('z_token', token); sessionStorage.setItem('z_welcome', mode === 'x' ? 'x' : '1'); location.hash = '#/import'; boot(); }
+      catch (e) { err(e.message === 'error' ? 'Try another handle' : e.message); }
+    };
+    $('#sb').onclick = create;
+    const enter = e => { if (e.key === 'Enter') { e.preventDefault(); mode === 'x' && !look ? $('#slook').click() : create(); } };
+    ['#sn', '#sh', '#sx'].forEach(id => { const el = $(id); if (el) el.addEventListener('keydown', enter); });
+    const lb = $('#slook'); if (lb) lb.onclick = async () => {
+      const u = $('#sx').value.trim().replace(/^@/, ''); if (!u) return err('Enter your X username');
+      err(''); lb.disabled = true; lb.textContent = '…';
+      try { look = await api('/lookup', 'POST', { username: u }); render(); $('#sn')?.focus(); } catch (e) { err(e.message); lb.disabled = false; lb.textContent = 'Look up'; }
+    };
+    (mode === 'new' ? $('#sn') : $('#sx')).focus();
   };
-  $('#sb').onclick = go; $('#sh').onkeydown = e => e.key === 'Enter' && go();
+  render();
 }
 async function boot() {
   if (!token) return signup();
