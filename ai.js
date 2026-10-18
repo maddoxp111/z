@@ -43,13 +43,36 @@ function fbReplies(n) {
 }
 
 // ---------- generators ----------
-async function genPosts(accts) {
-  const list = accts.map(a => `- @${a.handle} (${a.name}, ${a.kind}): voice = ${a.voice}`).join('\n');
-  const j = await askJSON(`Write ONE brand-new post (max 240 chars, in-universe, as of right now) for each account below, in that account's authentic voice. News/commentary accounts invent fresh, specific, fictional-but-plausible (and silly/harmless) stories; be specific, not generic. Vary formats.\n${list}\n\nReturn JSON array: [{"handle":"...","text":"..."}]`, 1500);
-  if (!Array.isArray(j)) return accts.map(fbPost);
-  const norm = h => String(h).replace(/^@/, '').toLowerCase();
-  const out = j.filter(x => x && x.handle && x.text);
-  return accts.map(a => { const f = out.find(x => norm(x.handle) === a.handle.toLowerCase()); return f ? { handle: a.handle, text: String(f.text) } : fbPost(a); });
+const card = a => `### @${a.handle} — ${a.name} (${a.kind} account${a.followers ? ', ' + Math.round(a.followers / 1e5) / 10 + 'M followers' : ''})
+Voice & formatting: ${a.voice}
+Talks about: ${a.topics || 'whatever fits the account'}
+Style samples (imitate the STYLE, never copy the content): ${(a.ex || []).map(e => JSON.stringify(e)).join(' | ')}`;
+const RULES = `Rules: every post must be unmistakably in its author's own voice (word choice, punctuation, caps, emoji habits, length, formatting). Be specific and fresh: concrete names, numbers, places, details. No generic filler like "Big things coming". Vary length and format across posts. No hashtags unless the persona uses them. Max 270 characters each. Posts about real people must be harmless and obviously silly/fictional.`;
+// reqs: [{a, n, recent: [texts], span}] -> { [handleLower]: [text,...] } (oldest -> newest)
+async function genPostsBatch(reqs, { when = 'right now' } = {}) {
+  const blocks = reqs.map(r => `${card(r.a)}\nPosts needed: ${r.n}${r.n > 1 ? ` (oldest to newest, spread across ${r.span || when})` : ` (as of ${when})`}${r.recent && r.recent.length ? `\nTheir recent posts (do NOT repeat, but you may continue storylines): ${r.recent.slice(0, 5).map(t => JSON.stringify(t.slice(0, 120))).join(' | ')}` : ''}`).join('\n\n');
+  const j = await askJSON(`You ghostwrite posts for accounts on Z, a parody social network. Below are persona cards.\n\n${blocks}\n\n${RULES}\nReturn ONE JSON object mapping each handle (no @) to an array of post strings: {"handle":["post",...]}`, Math.min(7000, 600 + reqs.reduce((t, r) => t + r.n, 0) * 140));
+  const out = {};
+  for (const r of reqs) {
+    const key = Object.keys(j || {}).find(k => k.replace(/^@/, '').toLowerCase() === r.a.handle.toLowerCase());
+    let arr = key && Array.isArray(j[key]) ? j[key].map(x => (typeof x === 'string' ? x : x && x.text)).filter(Boolean) : [];
+    while (arr.length < r.n) arr.push(fbPost(r.a).text);
+    out[r.a.handle.toLowerCase()] = arr.slice(0, r.n);
+  }
+  return out;
+}
+async function genPosts(accts) { // single post each (live ticks)
+  const o = await genPostsBatch(accts.map(a => ({ a, n: 1, recent: a.recent })));
+  return accts.map(a => ({ handle: a.handle, text: o[a.handle.toLowerCase()][0] }));
+}
+// Account-to-account replies. items: [{id, a (replier), target:{handle,name,text}, tone?}] -> {id: text}
+async function genAccountReplies(items) {
+  if (!items.length) return {};
+  const blocks = items.map(it => `[#${it.id}] ${card(it.a)}\n   is replying to @${it.target.handle} (${it.target.name}), who posted: ${JSON.stringify(it.target.text.slice(0, 220))}${it.target.isUser ? '\n   (the target is a small up-and-coming account run by the player)' : ''}${it.tone ? '\n   Mood: ' + it.tone : ''}`).join('\n\n');
+  const j = await askJSON(`On Z (a parody social network) these accounts are replying to other accounts' posts. Write each reply in the replier's authentic voice, reacting to the exact content of the post (agree, joke, tease, correct, hype, clap back playfully, or add a fact depending on their persona). Under 200 chars. Harmless and playful; no real-world accusations.\n\n${blocks}\n\nReturn ONE JSON object mapping each id number to a reply string: {"12":"reply"}`, Math.min(5000, 400 + items.length * 120));
+  const out = {};
+  for (const it of items) { const v = j && (j[it.id] ?? j['#' + it.id]); out[it.id] = typeof v === 'string' && v.trim() ? v.trim() : fbReplies(1)[0].text; }
+  return out;
 }
 // Generates fake-people replies to a post (some are threaded: "parent" = index of an earlier reply).
 async function genReplies({ authorHandle, authorName, text, n, existing = [] }) {
@@ -62,12 +85,12 @@ async function genUserReplies({ userName, userHandle, text, ctx, n }) {
   return Array.isArray(j) && j.length ? j.filter(x => x && x.text && x.handle) : fbReplies(n);
 }
 async function genCelebReply(a, { postText, userText, userName, fame }) {
-  const j = await askJSON(`You are ${a.name} (@${a.handle}), voice: ${a.voice}. A fan named ${userName} (about ${fame} followers) ${postText ? `commented on your post ${JSON.stringify(postText)}:` : 'posted:'} ${JSON.stringify(userText)}\nWrite your short reply (<200 chars), noticing them in-voice (funny/impressed/teasing). JSON: {"text":""}`, 300);
+  const j = await askJSON(`You are ${a.name} (@${a.handle}). ${a.voice ? 'Voice: ' + a.voice + '. ' : ''}${a.topics ? 'You talk about: ' + a.topics + '. ' : ''}A fan named ${userName} (about ${fame} followers) ${postText ? `commented on your post ${JSON.stringify(postText)}:` : 'posted:'} ${JSON.stringify(userText)}\nWrite your short reply (<200 chars), noticing them in-voice (funny/impressed/teasing). JSON: {"text":""}`, 300);
   return j && j.text ? j.text : pick(['ok this is actually funny 😭', 'respect.', 'Who is this? Love it', 'W comment', 'lmaooo I see you 👀']);
 }
 async function genDMReply(a, { history, userName, fame, ratio }) {
   const stance = ratio < 0.0005 ? 'The user is a total nobody to you. Be dismissive, short, maybe skeptical, "who is this", or give a polite brush-off. Do not agree to anything.' : ratio < 0.01 ? 'The user is small but you are mildly aware of them. Be lukewarm, brief, slightly condescending but not rude.' : ratio < 0.1 ? 'The user has a real following. Be friendly and receptive, open to collabs.' : 'The user is almost as famous as you. Be warm, respectful, treat them as an equal.';
-  const j = await askJSON(`You are ${a.name} (@${a.handle}), a ${a.kind} account. Voice: ${a.voice}. You are replying in a DM to ${userName} who has ${fame} followers (you have ${a.followers}). ${stance}\nConversation so far (oldest first):\n${history.map(h => (h.from_user ? userName : a.name) + ': ' + h.text).join('\n')}\n\nWrite your next DM, 1-2 sentences, in-voice. JSON: {"text":""}`, 300);
+  const j = await askJSON(`You are ${a.name} (@${a.handle}), a ${a.kind} account. Voice: ${a.voice}. You talk about: ${a.topics || 'your world'}. You are replying in a DM to ${userName} who has ${fame} followers (you have ${a.followers}). ${stance}\nConversation so far (oldest first):\n${history.map(h => (h.from_user ? userName : a.name) + ': ' + h.text).join('\n')}\n\nWrite your next DM, 1-2 sentences, in-voice. JSON: {"text":""}`, 300);
   return j && j.text ? j.text : pick(['who dis', 'lol ok', 'appreciate it', 'hit me later']);
 }
 async function genIncomingDM({ userName, fame, sender }) {
@@ -80,4 +103,4 @@ async function genTrends() {
     { cat: 'Trending in Music', topic: '#ZAlbumFriday', posts: '184K' }, { cat: 'Sports · Trending', topic: 'Game 7', posts: '92.3K' },
     { cat: 'Entertainment · Trending', topic: 'Surprise drop', posts: '51.2K' }, { cat: 'Trending', topic: 'Benches', posts: '12.4K' }, { cat: 'Politics · Trending', topic: 'Inbox Zero', posts: '8,311' }];
 }
-module.exports = { genPosts, genReplies, genUserReplies, genCelebReply, genDMReply, genIncomingDM, genTrends, hasKey: !!KEY, MODEL };
+module.exports = { genPostsBatch, genAccountReplies, card, genPosts, genReplies, genUserReplies, genCelebReply, genDMReply, genIncomingDM, genTrends, hasKey: !!KEY, MODEL };

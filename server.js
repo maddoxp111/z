@@ -1,7 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
-const { q, q1, init } = require('./db');
+const { pool: pgPool, q, q1, init } = require('./db');
 const ai = require('./ai');
 const ACCOUNTS = require('./accounts');
 
@@ -211,7 +211,7 @@ app.post('/api/post', auth, wrap(async (req, res) => {
   const fame = await userFollowers(u);
   const recent = await q1(`SELECT count(*) c FROM posts WHERE author_id=$1 AND created_at > now() - interval '10 minutes'`, [u.id]);
   const spam = Number(recent.c) > 5 ? 0.25 : 1;
-  const parent = parent_id ? await q1(`SELECT p.*, a.handle, a.name, a.followers, a.kind, a.voice FROM posts p JOIN accounts a ON a.id=p.author_id WHERE p.id=$1`, [parent_id]) : null;
+  const parent = parent_id ? await q1(`SELECT p.*, a.handle, a.name, a.followers, a.kind, a.voice, a.rpd, a.topics FROM posts p JOIN accounts a ON a.id=p.author_id WHERE p.id=$1`, [parent_id]) : null;
 
   const viral = Math.random() < VIRAL_CHANCE * spam;
   const scale = parent ? 0.025 : 0.05;
@@ -231,9 +231,9 @@ app.post('/api/post', auth, wrap(async (req, res) => {
   // a famous account might notice a comment on its post
   if (parent && parent.kind !== 'npc' && parent.kind !== 'user') {
     const ratio = fame / Math.max(1, Number(parent.followers));
-    const p = Math.min(0.5, 0.02 + 0.6 * Math.sqrt(ratio));
+    const p = Math.min(0.6, (0.02 + 0.6 * Math.sqrt(ratio)) * (0.4 + Number(parent.rpd ?? 1) / 8));
     if (Math.random() < p) {
-      const acct = ACCOUNTS.find(a => a.handle.toLowerCase() === parent.handle.toLowerCase()) || { name: parent.name, handle: parent.handle, voice: parent.voice, kind: parent.kind };
+      const acct = withPersona({ name: parent.name, handle: parent.handle, voice: parent.voice, kind: parent.kind });
       ai.genCelebReply(acct, { postText: parent.text, userText: text, userName: u.name, fame }).then(async reply => {
         const delay = rnd(8, 40);
         const t = new Date(Date.now() + delay * 1000);
@@ -385,60 +385,257 @@ app.get('/api/poll', auth, wrap(async (req, res) => {
   res.json({ notifs: Number(n.c), dms: Number(d.c), followers: Number(u.followers), verified: u.verified });
 }));
 
-// ---------------- the simulation: AI accounts keep posting ----------------
-let seeding = false;
+// ---------------- the simulation: AI accounts post & reply on their own schedules ----------------
+const PERSONA = Object.fromEntries(ACCOUNTS.map(a => [a.handle.toLowerCase(), a]));
+const withPersona = r => { const p = PERSONA[String(r.handle).toLowerCase()] || {}; return { ...r, voice: p.voice || r.voice, topics: p.topics, ex: p.ex }; };
+const TICK_MS = Number(process.env.TICK_MS) || 20000;
+// Global knobs (editable live in the Sim tab, persisted in kv 'settings').
+//  postMult/replyMult: sim-speed multipliers on every account's ppd/rpd. 1 = real-time schedule, 60 = a sim-hour per real minute.
+//  idlePause: don't spend API credits while nobody has the site open.
+let settings = { postMult: Number(process.env.POST_MULT) || 6, replyMult: Number(process.env.REPLY_MULT) || 6, paused: false, idlePause: process.env.IDLE_PAUSE !== 'false', maxPerTick: 8, maxRepliesPerTick: 6, simBudget: 350, simReplyBudget: 120 };
+let lastActive = Date.now();
+let simState = { day: 0 };
+const saveKV = (k, v) => q(`INSERT INTO kv VALUES($1,$2,now()) ON CONFLICT (k) DO UPDATE SET v=$2, updated_at=now()`, [k, JSON.stringify(v)]);
+async function loadKV() {
+  const a = await q1(`SELECT v FROM kv WHERE k='settings'`); if (a) settings = { ...settings, ...a.v };
+  const b = await q1(`SELECT v FROM kv WHERE k='sim'`); if (b) simState = { ...simState, ...b.v };
+}
+app.use((req, res, next) => { if (req.path.startsWith('/api/') && req.get('x-token')) lastActive = Date.now(); next(); });
+
 async function seedAccounts() {
   for (const a of ACCOUNTS) {
-    await q(`INSERT INTO accounts(handle,name,bio,followers,following,verified,kind,pfp,voice,activity)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (handle) DO UPDATE SET name=$2, bio=$3, verified=$6, kind=$7, pfp=$8, voice=$9, activity=$10`,
-      [a.handle, a.name, a.bio, a.followers, Math.floor(rnd(0, 1500)), a.v, a.kind, `https://unavatar.io/x/${a.handle}`, a.voice, a.activity]);
+    await q(`INSERT INTO accounts(handle,name,bio,followers,following,verified,kind,pfp,voice,activity,topics,ppd,rpd)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      ON CONFLICT (handle) DO UPDATE SET name=$2, bio=$3, verified=$6, kind=$7, pfp=$8, voice=$9, topics=$11,
+        ppd=CASE WHEN accounts.tuned THEN accounts.ppd ELSE $12 END, rpd=CASE WHEN accounts.tuned THEN accounts.rpd ELSE $13 END`,
+      [a.handle, a.name, a.bio, a.followers, Math.floor(rnd(0, 1500)), a.v, a.kind, `https://unavatar.io/x/${a.handle}`, a.voice, a.ppd, a.topics, a.ppd, a.rpd]);
   }
 }
-async function publishFor(accts, ageSec = 0) {
-  const items = await ai.genPosts(accts);
-  for (const it of items) {
-    const a = accts.find(x => x.handle.toLowerCase() === it.handle.toLowerCase());
-    if (!a) continue;
-    const t = targetsFor(a);
-    await q(`INSERT INTO posts(author_id,text,created_at,likes_target,reposts_target,replies_target,views_target,tau) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [a.id, String(it.text).slice(0, 280), new Date(Date.now() - ageSec * 1000 * Math.random()), t.likes, t.reposts, t.replies, t.views, tauFor(a.kind) * rnd(0.6, 1.6) | 0]);
-  }
+const stoch = x => Math.floor(x) + (Math.random() < x - Math.floor(x) ? 1 : 0);
+const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
+async function pool(items, conc, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(conc, items.length) }, async () => { while (i < items.length) { const it = items[i++]; try { await fn(it); } catch (e) { console.error('[pool]', e.message); } } }));
 }
-function weighted(arr, n) {
-  const out = []; const pool = [...arr];
-  while (out.length < n && pool.length) {
-    const tot = pool.reduce((s, a) => s + a.activity, 0); let r = Math.random() * tot, i = 0;
-    for (; i < pool.length; i++) { r -= pool[i].activity; if (r <= 0) break; }
-    out.push(pool.splice(Math.min(i, pool.length - 1), 1)[0]);
+async function insertAcctPost(a, text, at) {
+  const t = targetsFor(a);
+  const r = await q1(`INSERT INTO posts(author_id,text,created_at,likes_target,reposts_target,replies_target,views_target,tau) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, author_id, text, created_at, likes_target`,
+    [a.id, String(text).slice(0, 280), at, t.likes, t.reposts, t.replies, t.views, tauFor(a.kind) * rnd(0.6, 1.6) | 0]);
+  return r;
+}
+async function recentPosts(accts) {
+  const rows = await q(`SELECT author_id, text FROM (SELECT author_id, text, row_number() OVER (PARTITION BY author_id ORDER BY created_at DESC) rn FROM posts WHERE author_id = ANY($1) AND parent_id IS NULL) x WHERE rn<=4`, [accts.map(a => a.id)]);
+  const m = {}; rows.forEach(r => (m[r.author_id] ||= []).push(r.text)); return m;
+}
+// Pick which post each replier answers (weighted by popularity, affinity, and a bump for the player's posts).
+function pickTargets(repliers, cands) {
+  const out = [];
+  for (const r of repliers) {
+    const ws = cands.map(c => {
+      if (c.author_id === r.id) return 0;
+      let w = Math.sqrt(Number(c.likes_target) + 1);
+      if (c.kind === r.kind) w *= 2;
+      if (r.kind === 'commentary' && c.kind === 'celeb') w *= 2.5;
+      if (r.kind === 'news' && c.kind !== 'news') w *= 0.2;
+      if (c.akind === 'user') w *= 40;
+      return w;
+    });
+    const tot = ws.reduce((x, y) => x + y, 0); if (!tot) continue;
+    let x = Math.random() * tot, i = 0; for (; i < ws.length; i++) { x -= ws[i]; if (x <= 0) break; }
+    out.push({ r, c: cands[Math.min(i, cands.length - 1)] });
   }
   return out;
 }
-async function tick() {
-  if (seeding) return;
-  const accts = await q(`SELECT * FROM accounts WHERE kind IN ('celeb','commentary','news')`);
-  if (!accts.length) return;
-  await publishFor(weighted(accts, 3));
+async function runReplies(pairs, { place }) {
+  if (!pairs.length) return 0;
+  let n = 0;
+  await pool(chunk(pairs, 8), 3, async rawBatch => {
+    const batch = rawBatch.map((b, i) => ({ ...b, id: i + 1 })); // ids are local to each LLM call
+    const out = await ai.genAccountReplies(batch.map(b => ({ id: b.id, a: withPersona(b.r), target: { handle: b.c.handle, name: b.c.name, text: b.c.text, isUser: b.c.akind === 'user' } })));
+    for (const b of batch) {
+      const at = place(b);
+      const t = targetsFor(b.r);
+      const likes = Math.round(t.likes * 0.15);
+      const row = await q1(`INSERT INTO posts(author_id,text,created_at,likes_target,reposts_target,views_target,tau,parent_id) VALUES($1,$2,$3,$4,$5,$6,600,$7) RETURNING id`,
+        [b.r.id, String(out[b.id]).slice(0, 280), at, likes, Math.round(likes * 0.05), likes * 12, b.c.pid]);
+      if (b.c.akind === 'user') { // an AI account replied to the player
+        const gain = Math.round(Math.min(Number(b.r.followers) * 0.001, 200000) * rnd(0.3, 1.2)) + 20;
+        await q('UPDATE accounts SET bonus_followers=bonus_followers+$2 WHERE id=$1', [b.c.author_id, gain]);
+        await q(`INSERT INTO notifs(user_id,type,actor_id,post_id,text,created_at) VALUES($1,$2,$3,$4,$5,$6)`, [b.c.author_id, b.r.kind === 'celeb' ? 'celeb_reply' : 'reply', b.r.id, row.id, String(out[b.id]).slice(0, 280), at]);
+      }
+      n++; if (simJob.running) simJob.done++;
+    }
+  });
+  return n;
 }
+const CAND_SQL = `SELECT p.id AS pid, p.author_id, p.text, p.likes_target, a.handle, a.name, a.kind, a.kind AS akind FROM posts p JOIN accounts a ON a.id=p.author_id
+  WHERE p.parent_id IS NULL AND p.created_at <= now() AND p.created_at > now() - interval '8 hours' ORDER BY p.created_at DESC LIMIT 120`;
+
+async function tick() {
+  if (simJob.running || seeding || settings.paused) return;
+  if (settings.idlePause && Date.now() - lastActive > 10 * 60000) return;
+  const accts = await q(`SELECT * FROM accounts WHERE kind IN ('celeb','commentary','news')`);
+  const dt = TICK_MS / 1000;
+  const p1 = (rate) => Math.random() < 1 - Math.exp(-rate * dt * 1 / 86400);
+  const posters = accts.filter(a => p1(a.ppd * settings.postMult)).sort(() => Math.random() - .5).slice(0, settings.maxPerTick);
+  if (posters.length) {
+    const recent = await recentPosts(posters);
+    for (const grp of chunk(posters, 6)) {
+      const out = await ai.genPostsBatch(grp.map(a => ({ a: withPersona(a), n: 1, recent: recent[a.id] || [] })));
+      for (const a of grp) await insertAcctPost(a, out[a.handle.toLowerCase()][0], new Date());
+    }
+  }
+  const repliers = accts.filter(a => p1(a.rpd * settings.replyMult)).sort(() => Math.random() - .5).slice(0, settings.maxRepliesPerTick);
+  if (repliers.length) {
+    const cands = await q(CAND_SQL);
+    if (cands.length) await runReplies(pickTargets(repliers, cands), { place: () => new Date(Date.now() + rnd(2, 25) * 1000) });
+  }
+}
+
+// ---- fast-forward ("sim"): shift history back, then synthesize the elapsed period ----
+const simJob = { running: false, stop: false, phase: '', done: 0, total: 0, log: [], auto: { on: false, days: 1 }, startedAt: 0, last: null };
+const slog = m => { simJob.log.unshift(`${new Date().toLocaleTimeString()} ${m}`); simJob.log.length = Math.min(simJob.log.length, 40); };
+
+async function generateHistory({ days, shift, budget, replyBudget }) {
+  const secs = days * 86400;
+  const accts = await q(`SELECT * FROM accounts WHERE kind IN ('celeb','commentary','news')`);
+  if (shift) {
+    const c = await pgPool.connect();
+    try {
+      await c.query('BEGIN');
+      for (const t of ['posts', 'notifs', 'dms']) await c.query(`UPDATE ${t} SET created_at = created_at - make_interval(secs => $1)`, [secs]);
+      await c.query('COMMIT');
+    } catch (e) { await c.query('ROLLBACK'); throw e; } finally { c.release(); }
+  }
+  // how many posts each account gets: expected volume, compressed so quiet accounts still show up
+  const w = accts.map(a => Math.pow(Math.max(0.05, a.ppd), 0.7) * days);
+  const scale = Math.min(1, budget / w.reduce((x, y) => x + y, 0)) * 1;
+  const want = accts.map((a, i) => ({ a, n: Math.min(40, stoch(Math.max(w[i] * (budget / w.reduce((x, y) => x + y, 0)), days >= 1 && a.ppd >= 0.3 ? 0.6 : 0))) })).filter(x => x.n > 0);
+  // split into LLM calls (<=6 accounts, <=14 posts)
+  const calls = []; let cur = [], cnt = 0;
+  for (const x of want) { let left = x.n; while (left > 0) { const k = Math.min(left, 6); if (cur.length >= 6 || cnt + k > 16) { calls.push(cur); cur = []; cnt = 0; } cur.push({ a: x.a, n: k }); cnt += k; left -= k; } }
+  if (cur.length) calls.push(cur);
+  simJob.phase = 'Writing posts'; simJob.total = calls.length; simJob.done = 0;
+  const times = new Map(); // handle -> sorted timestamps
+  want.forEach(x => times.set(x.a.handle, Array.from({ length: x.n }, () => Date.now() - rnd(180, secs) * 1000).sort((a, b) => a - b)));
+  const made = [];
+  const when = days < 1 ? `the last ${Math.max(1, Math.round(days * 24))} hours` : `the last ${days} day${days > 1 ? 's' : ''}`;
+  await pool(calls, 4, async grp => {
+    if (simJob.stop) return;
+    const out = await ai.genPostsBatch(grp.map(g => ({ a: withPersona(g.a), n: g.n, span: when })), { when });
+    for (const g of grp) {
+      const arr = times.get(g.a.handle); const texts = out[g.a.handle.toLowerCase()];
+      for (let i = 0; i < texts.length; i++) { const at = new Date(arr.shift() || Date.now() - 60000); const r = await insertAcctPost(g.a, texts[i], at); made.push({ pid: r.id, author_id: g.a.id, text: texts[i], likes_target: r.likes_target, handle: g.a.handle, name: g.a.name, kind: g.a.kind, akind: g.a.kind, at: at.getTime() }); }
+    }
+    simJob.done++;
+  });
+  // replies between accounts
+  simJob.phase = 'Accounts replying to each other';
+  const rw = accts.map(a => Math.pow(Math.max(0.01, a.rpd), 0.8));
+  const nReply = Math.min(replyBudget, Math.round(accts.reduce((s, a) => s + a.rpd, 0) * days * 0.5));
+  const reps = [];
+  for (let i = 0; i < nReply; i++) { let x = Math.random() * rw.reduce((a, b) => a + b, 0), j = 0; for (; j < rw.length; j++) { x -= rw[j]; if (x <= 0) break; } reps.push(accts[Math.min(j, accts.length - 1)]); }
+  const withTarget = pickTargets(reps, made.length ? made : []);
+  // pickTargets expects cands to have pid; restrict to posts at least a few minutes before "now"
+  simJob.total = withTarget.length; simJob.done = 0;
+  await runReplies(withTarget, { place: b => new Date(Math.min(Date.now() - 30000, b.c.at + rnd(120, 6 * 3600) * 1000)) });
+  return { posts: made.length, replies: withTarget.length };
+}
+
+async function postSim(days) {
+  // follower drift for the cast + organic growth for players, then fresh trends
+  await q(`UPDATE accounts SET followers = followers + floor(followers * 0.0004 * $1 * (0.5 + random())) WHERE kind IN ('celeb','commentary','news')`, [days]);
+  const users = await q(`SELECT id, followers, name FROM accounts WHERE kind='user'`);
+  for (const u of users) {
+    const recent = await q1(`SELECT count(*) c FROM posts WHERE author_id=$1`, [u.id]);
+    if (Number(recent.c) < 1) continue;
+    const gain = Math.min(200000, Math.round(Number(u.followers) * 0.004 * days * rnd(0.5, 1.5)));
+    if (gain < 1) continue;
+    await q('UPDATE accounts SET bonus_followers=bonus_followers+$2 WHERE id=$1', [u.id, gain]);
+    await q(`INSERT INTO notifs(user_id,type,text) VALUES($1,'sim',$2)`, [u.id, `While ${days} day${days > 1 ? 's' : ''} passed on Z, your profile picked up ${gain.toLocaleString()} new followers.`]);
+  }
+  await saveKV('trends', await ai.genTrends());
+}
+
+async function simulate(days) {
+  if (simJob.running) return false;
+  Object.assign(simJob, { running: true, stop: false, startedAt: Date.now(), phase: 'Starting', done: 0, total: 0 });
+  slog(`Fast-forwarding ${days} day${days > 1 ? 's' : ''}…`);
+  try {
+    const r = await generateHistory({ days, shift: true, budget: settings.simBudget * Math.min(2, Math.sqrt(days)), replyBudget: settings.simReplyBudget });
+    simState.day += days; await saveKV('sim', simState);
+    simJob.phase = 'Wrapping up'; await postSim(days);
+    simJob.last = { days, ...r, seconds: Math.round((Date.now() - simJob.startedAt) / 1000) };
+    slog(`Day ${simState.day}: +${r.posts} posts, +${r.replies} replies (${simJob.last.seconds}s)`);
+  } catch (e) { console.error('[sim]', e); slog('Error: ' + e.message); }
+  simJob.running = false; simJob.phase = '';
+  if (simJob.auto.on && !simJob.stop) setTimeout(() => simulate(simJob.auto.days), 500);
+  return true;
+}
+
+const simState_ = () => ({ day: simState.day, running: simJob.running, phase: simJob.phase, done: simJob.done, total: simJob.total, log: simJob.log, auto: simJob.auto, last: simJob.last, settings, ai: ai.hasKey, model: ai.MODEL });
+app.get('/api/sim', auth, wrap(async (req, res) => {
+  const stats = await q1(`SELECT (SELECT count(*) FROM posts) AS posts, (SELECT count(*) FROM accounts WHERE kind IN ('celeb','commentary','news')) AS cast, (SELECT count(*) FROM accounts WHERE kind='npc') AS npcs`);
+  res.json({ ...simState_(), stats: { posts: Number(stats.posts), cast: Number(stats.cast), npcs: Number(stats.npcs) } });
+}));
+app.post('/api/sim/advance', auth, wrap(async (req, res) => {
+  const days = Math.max(0.25, Math.min(30, Number(req.body.days) || 1));
+  if (simJob.running) return res.status(409).json({ error: 'Already simulating' });
+  simulate(days);
+  res.json(simState_());
+}));
+app.post('/api/sim/auto', auth, wrap(async (req, res) => {
+  simJob.auto = { on: !!req.body.on, days: Math.max(0.25, Math.min(7, Number(req.body.days) || 1)) };
+  if (simJob.auto.on && !simJob.running) simulate(simJob.auto.days);
+  if (!simJob.auto.on) simJob.stop = true;
+  res.json(simState_());
+}));
+app.post('/api/sim/stop', auth, wrap(async (req, res) => { simJob.stop = true; simJob.auto.on = false; res.json(simState_()); }));
+app.post('/api/sim/settings', auth, wrap(async (req, res) => {
+  const b = req.body, num = (v, lo, hi, d) => Math.min(hi, Math.max(lo, Number.isFinite(Number(v)) ? Number(v) : d));
+  settings = { ...settings,
+    postMult: num(b.postMult, 0, 5000, settings.postMult), replyMult: num(b.replyMult, 0, 5000, settings.replyMult),
+    maxPerTick: num(b.maxPerTick, 1, 30, settings.maxPerTick), maxRepliesPerTick: num(b.maxRepliesPerTick, 0, 30, settings.maxRepliesPerTick),
+    simBudget: num(b.simBudget, 20, 2000, settings.simBudget), simReplyBudget: num(b.simReplyBudget, 0, 600, settings.simReplyBudget),
+    paused: b.paused === undefined ? settings.paused : !!b.paused, idlePause: b.idlePause === undefined ? settings.idlePause : !!b.idlePause };
+  await saveKV('settings', settings);
+  res.json(simState_());
+}));
+app.get('/api/sim/cast', auth, wrap(async (req, res) => {
+  const rows = await q(`SELECT handle, name, kind, followers, ppd, rpd, tuned, pfp, verified, (SELECT count(*) FROM posts p WHERE p.author_id=a.id AND p.parent_id IS NULL) AS posts
+    FROM accounts a WHERE kind IN ('celeb','commentary','news') ORDER BY followers DESC`);
+  res.json(rows.map(r => ({ ...r, followers: Number(r.followers), posts: Number(r.posts) })));
+}));
+app.post('/api/sim/cast/:handle', auth, wrap(async (req, res) => {
+  const ppd = Math.min(200, Math.max(0, Number(req.body.ppd))), rpd = Math.min(200, Math.max(0, Number(req.body.rpd)));
+  if (!Number.isFinite(ppd) || !Number.isFinite(rpd)) return res.status(400).json({ error: 'bad' });
+  await q(`UPDATE accounts SET ppd=$2, rpd=$3, tuned=true WHERE lower(handle)=lower($1) AND kind IN ('celeb','commentary','news')`, [req.params.handle, ppd, rpd]);
+  res.json({ ok: true });
+}));
+app.post('/api/sim/cast-reset', auth, wrap(async (req, res) => { await q(`UPDATE accounts SET tuned=false WHERE kind IN ('celeb','commentary','news')`); await seedAccounts(); res.json({ ok: true }); }));
+
+let seeding = false;
 async function bootstrap() {
   seeding = true;
   try {
     await seedAccounts();
-    const accts = await q(`SELECT * FROM accounts WHERE kind IN ('celeb','commentary','news')`);
     const n = await q1('SELECT count(*) c FROM posts');
-    if (Number(n.c) < 20) {
+    if (Number(n.c) < 30) {
       console.log('[z] seeding initial timeline…');
-      for (let i = 0; i < accts.length; i += 6) await publishFor(accts.slice(i, i + 6), 3600);
-      for (let i = 0; i < accts.length; i += 6) await publishFor(accts.slice(i, i + 6), 3600);
+      simJob.running = true; simJob.phase = 'Seeding timeline';
+      const r = await generateHistory({ days: 0.25, shift: false, budget: 230, replyBudget: 40 });
+      console.log(`[z] seeded ${r.posts} posts, ${r.replies} replies`);
+      simJob.running = false; simJob.phase = '';
     }
-    const tr = await q1(`SELECT updated_at FROM kv WHERE k='trends'`);
-    if (!tr) await q(`INSERT INTO kv VALUES('trends',$1,now()) ON CONFLICT (k) DO UPDATE SET v=$1, updated_at=now()`, [JSON.stringify(await ai.genTrends())]);
-  } finally { seeding = false; }
+    if (!(await q1(`SELECT 1 FROM kv WHERE k='trends'`))) await saveKV('trends', await ai.genTrends());
+  } finally { seeding = false; simJob.running = false; }
 }
 
 const PORT = process.env.PORT || 3000;
 init().then(async () => {
-  app.listen(PORT, () => console.log(`[z] listening on ${PORT} · ai=${ai.hasKey ? ai.MODEL : 'OFFLINE FALLBACK (set ANTHROPIC_API_KEY)'}`));
+  await loadKV();
+  app.listen(PORT, () => console.log(`[z] listening on ${PORT} · ai=${ai.hasKey ? ai.MODEL : 'OFFLINE FALLBACK (set ANTHROPIC_API_KEY)'} · ${ACCOUNTS.length} accounts`));
   bootstrap().catch(e => console.error('bootstrap', e));
-  setInterval(() => tick().catch(e => console.error('tick', e)), Number(process.env.TICK_MS) || 30000);
-  setInterval(async () => { try { await q(`INSERT INTO kv VALUES('trends',$1,now()) ON CONFLICT (k) DO UPDATE SET v=$1, updated_at=now()`, [JSON.stringify(await ai.genTrends())]); } catch (e) { console.error(e); } }, 15 * 60000);
+  setInterval(() => tick().catch(e => console.error('tick', e)), TICK_MS);
+  setInterval(async () => { try { if (!settings.paused && Date.now() - lastActive < 10 * 60000) await saveKV('trends', await ai.genTrends()); } catch (e) { console.error(e); } }, 15 * 60000);
 }).catch(e => { console.error('DB init failed', e.message); process.exit(1); });
