@@ -420,7 +420,7 @@ app.get('/api/poll', auth, wrap(async (req, res) => {
   res.json({ notifs: Number(n.c), dms: Number(d.c), followers: Number(u.followers), verified: u.verified });
 }));
 
-// ---------------- import your X (Twitter) account ----------------
+// ---------------- import your X account ----------------
 // Two sources: (1) username lookup via the X API when X_BEARER_TOKEN is set (public profile + recent public posts),
 // (2) the official X data archive the user uploads in the browser (posts, likes, follower count) — proves ownership too.
 const X_TOKEN = process.env.X_BEARER_TOKEN;

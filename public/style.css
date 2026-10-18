@@ -1,4 +1,4 @@
-/* Z — X (Twitter) "Lights out" theme */
+/* Z — X "Lights out" theme */
 :root{--bg:#000;--text:#e7e9ea;--mute:#71767b;--line:#2f3336;--blue:#1d9bf0;--blue-h:#1a8cd8;--card:#16181c;--hover:rgba(231,233,234,.1);--row:rgba(255,255,255,.03);--pink:#f91880;--green:#00ba7c;--red:#f4212e;--gold:#e2b719}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--text);font-family:TwitterChirp,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:20px;-webkit-font-smoothing:antialiased}
