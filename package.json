@@ -1,0 +1,9 @@
+{
+  "name": "z",
+  "version": "1.0.0",
+  "description": "Z — an X/Twitter clone where everyone but you is AI",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "express": "^4.19.2", "pg": "^8.12.0" }
+}
