@@ -68,10 +68,14 @@ async function genPosts(accts) { // single post each (live ticks)
 // Account-to-account replies. items: [{id, a (replier), target:{handle,name,text}, tone?}] -> {id: text}
 async function genAccountReplies(items) {
   if (!items.length) return {};
-  const blocks = items.map(it => `[#${it.id}] ${card(it.a)}\n   is replying to @${it.target.handle} (${it.target.name}), who posted: ${JSON.stringify(it.target.text.slice(0, 220))}${it.target.isUser ? '\n   (the target is a small up-and-coming account run by the player)' : ''}${it.tone ? '\n   Mood: ' + it.tone : ''}`).join('\n\n');
-  const j = await askJSON(`On Z (a parody social network) these accounts are replying to other accounts' posts. Write each reply in the replier's authentic voice, reacting to the exact content of the post (agree, joke, tease, correct, hype, clap back playfully, or add a fact depending on their persona). Under 200 chars. Harmless and playful; no real-world accusations.\n\n${blocks}\n\nReturn ONE JSON object mapping each id number to a reply string: {"12":"reply"}`, Math.min(5000, 400 + items.length * 120));
+  const blocks = items.map(it => `=== TASK ${it.id} ===\nReplier:\n${card(it.a)}\nIs replying to @${it.target.handle} (${it.target.name}), whose post says: ${JSON.stringify(it.target.text.slice(0, 220))}${it.target.isUser ? '\n(the target is a small up-and-coming account run by the player)' : ''}`).join('\n\n');
+  const j = await askJSON(`On Z (a parody social network) these accounts are replying to other accounts' posts. For each TASK write the replier's reply in their authentic voice, reacting to the exact content of THAT task's post only (agree, joke, tease, correct, hype, or add a fact depending on persona). Under 200 chars. Harmless and playful; no real-world accusations.\n\n${blocks}\n\nReturn a JSON array with one object per task, in order: [{"task":1,"replying_to":"handle","reply":"..."}]`, Math.min(5000, 400 + items.length * 130));
   const out = {};
-  for (const it of items) { const v = j && (j[it.id] ?? j['#' + it.id]); out[it.id] = typeof v === 'string' && v.trim() ? v.trim() : fbReplies(1)[0].text; }
+  const arr = Array.isArray(j) ? j : [];
+  for (const it of items) {
+    const m = arr.find(x => x && Number(x.task) === it.id && String(x.replying_to || '').replace(/^@/, '').toLowerCase() === it.target.handle.toLowerCase()) || arr.find(x => x && Number(x.task) === it.id);
+    out[it.id] = m && typeof m.reply === 'string' && m.reply.trim() ? m.reply.trim() : fbReplies(1)[0].text;
+  }
   return out;
 }
 // Generates fake-people replies to a post (some are threaded: "parent" = index of an earlier reply).
