@@ -6,7 +6,7 @@ const ai = require('./ai');
 const ACCOUNTS = require('./accounts');
 
 const app = express();
-app.use(express.json({ limit: '50kb' }));
+app.use((req, res, next) => express.json({ limit: req.path === '/api/import' ? '8mb' : '50kb' })(req, res, next));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------------- tuning knobs ----------------
@@ -33,7 +33,7 @@ async function auth(req, res, next) {
 const wrap = f => (req, res) => f(req, res).catch(e => { console.error(e); res.status(500).json({ error: 'server' }); });
 
 async function userFollowers(u) {
-  const r = await q1(`SELECT COALESCE(floor(sum(${LIKES_NOW})),0) AS l FROM posts p WHERE p.author_id=$1`, [u.id]);
+  const r = await q1(`SELECT COALESCE(floor(sum(${LIKES_NOW})),0) AS l FROM posts p WHERE p.author_id=$1 AND NOT p.imported`, [u.id]);
   const f = START_FOLLOWERS + Number(u.bonus_followers) + Math.floor(Number(r.l) * LIKE_FOLLOW_RATE);
   const verified = f >= VERIFY_AT ? 'blue' : 'none';
   if (f !== Number(u.followers) || verified !== u.verified) await q('UPDATE accounts SET followers=$2, verified=$3 WHERE id=$1', [u.id, f, verified]);
@@ -177,16 +177,16 @@ const genLocks = new Set();
 app.get('/api/post/:id/replies', auth, wrap(async (req, res) => {
   const id = Number(req.params.id);
   const more = req.query.more === '1';
-  const p = await q1(`SELECT p.*, a.handle, a.name FROM posts p JOIN accounts a ON a.id=p.author_id WHERE p.id=$1`, [id]);
+  const p = await q1(`SELECT p.*, a.handle, a.name, a.profile, a.kind AS akind FROM posts p JOIN accounts a ON a.id=p.author_id WHERE p.id=$1`, [id]);
   if (!p) return res.status(404).json({ error: 'nf' });
   const isUserPost = p.author_id === req.user.id;
-  const need = (p.replies_gen === 0 && !isUserPost) || (more && p.replies_gen < 4);
+  const need = (p.replies_gen === 0 && (!isUserPost || p.imported)) || (more && p.replies_gen < 4);
   if (need && !genLocks.has(id)) {
     genLocks.add(id);
     try {
       const existing = await q(`SELECT text FROM posts WHERE parent_id=$1 ORDER BY created_at DESC LIMIT 6`, [id]);
       const n = p.replies_gen === 0 ? 10 : 8;
-      const items = await ai.genReplies({ authorHandle: p.handle, authorName: p.name, text: p.text, n, existing: existing.map(e => e.text) });
+      const items = await ai.genReplies({ authorHandle: p.handle, authorName: p.name, text: p.text, n, existing: existing.map(e => e.text), about: p.akind === 'user' ? p.profile : null });
       await insertReplies(p, items, { startAgeSec: Math.min(900, (Date.now() - new Date(p.created_at)) / 1000) });
       await q('UPDATE posts SET replies_gen=replies_gen+1 WHERE id=$1', [id]);
     } finally { genLocks.delete(id); }
@@ -225,7 +225,7 @@ app.post('/api/post', auth, wrap(async (req, res) => {
 
   // NPC reactions arrive over the next couple of minutes
   const nReact = Math.min(6, 1 + Math.round(Math.log10(fame + 10)));
-  ai.genUserReplies({ userName: u.name, userHandle: u.handle, text, ctx: parent ? `in reply to @${parent.handle}` : '', n: nReact })
+  ai.genUserReplies({ userName: u.name, userHandle: u.handle, text, ctx: parent ? `in reply to @${parent.handle}` : '', n: nReact, profile: u.profile })
     .then(items => insertFutureReplies(row, items, 150)).catch(e => console.error(e));
 
   // a famous account might notice a comment on its post
@@ -234,7 +234,7 @@ app.post('/api/post', auth, wrap(async (req, res) => {
     const p = Math.min(0.6, (0.02 + 0.6 * Math.sqrt(ratio)) * (0.4 + Number(parent.rpd ?? 1) / 8));
     if (Math.random() < p) {
       const acct = withPersona({ name: parent.name, handle: parent.handle, voice: parent.voice, kind: parent.kind });
-      ai.genCelebReply(acct, { postText: parent.text, userText: text, userName: u.name, fame }).then(async reply => {
+      ai.genCelebReply(acct, { postText: parent.text, userText: text, userName: u.name, fame, profile: u.profile }).then(async reply => {
         const delay = rnd(8, 40);
         const t = new Date(Date.now() + delay * 1000);
         const gain = Math.round(Math.min(Number(parent.followers) * 0.002, 400000) * rnd(0.3, 1.5)) + 50;
@@ -350,7 +350,7 @@ app.post('/api/dms/:handle', auth, wrap(async (req, res) => {
     const history = await q('SELECT from_user, text FROM dms WHERE user_id=$1 AND account_id=$2 ORDER BY created_at DESC LIMIT 10', [req.user.id, a.id]);
     history.reverse();
     const acct = ACCOUNTS.find(x => x.handle.toLowerCase() === a.handle.toLowerCase()) || a;
-    ai.genDMReply({ ...acct, followers: a.followers }, { history, userName: req.user.name, fame, ratio }).then(reply =>
+    ai.genDMReply({ ...acct, followers: a.followers }, { history, userName: req.user.name, fame, ratio, profile: req.user.profile }).then(reply =>
       q('INSERT INTO dms(user_id,account_id,from_user,text,created_at) VALUES($1,$2,false,$3,$4)', [req.user.id, a.id, reply, new Date(Date.now() + rnd(3, 20) * 1000)])
     ).catch(e => console.error(e));
   }
@@ -374,7 +374,7 @@ app.get('/api/poll', auth, wrap(async (req, res) => {
       sender = await q1('SELECT * FROM accounts WHERE id=$1', [id]);
     }
     if (sender) {
-      const text = await ai.genIncomingDM({ userName: u.name, fame, sender });
+      const text = await ai.genIncomingDM({ userName: u.name, fame, sender, profile: u.profile });
       await q('INSERT INTO dms(user_id,account_id,from_user,text) VALUES($1,$2,false,$3)', [u.id, sender.id, text]);
       if (sender.kind === 'celeb') await q(`INSERT INTO notifs(user_id,type,actor_id,text) VALUES($1,'celeb_dm',$2,'sent you a message')`, [u.id, sender.id]);
     }
@@ -383,6 +383,76 @@ app.get('/api/poll', auth, wrap(async (req, res) => {
   const d = await q1(`SELECT count(*) c FROM (
       SELECT DISTINCT ON (account_id) account_id, from_user FROM dms WHERE user_id=$1 AND created_at<=now() ORDER BY account_id, created_at DESC) x WHERE NOT x.from_user`, [u.id]);
   res.json({ notifs: Number(n.c), dms: Number(d.c), followers: Number(u.followers), verified: u.verified });
+}));
+
+// ---------------- import your X (Twitter) account ----------------
+// Two sources: (1) username lookup via the X API when X_BEARER_TOKEN is set (public profile + recent public posts),
+// (2) the official X data archive the user uploads in the browser (posts, likes, follower count) — proves ownership too.
+const X_TOKEN = process.env.X_BEARER_TOKEN;
+async function xFetch(path) {
+  const r = await fetch('https://api.x.com/2' + path, { headers: { authorization: 'Bearer ' + X_TOKEN } });
+  if (!r.ok) throw Object.assign(new Error(r.status === 402 || r.status === 403 ? 'Your X API plan does not allow this lookup' : r.status === 404 ? 'X user not found' : `X API error ${r.status}`), { status: 502 });
+  return r.json();
+}
+async function lookupX(username) {
+  const out = { username, name: null, bio: null, followers: null, pfp: `https://unavatar.io/x/${username}`, posts: [], source: 'unavatar' };
+  if (!X_TOKEN) return out;
+  const u = (await xFetch(`/users/by/username/${encodeURIComponent(username)}?user.fields=description,profile_image_url,public_metrics,verified`)).data;
+  if (!u) throw Object.assign(new Error('X user not found'), { status: 404 });
+  Object.assign(out, { name: u.name, bio: u.description, followers: u.public_metrics?.followers_count, source: 'x-api' });
+  if (u.profile_image_url) out.pfp = u.profile_image_url.replace('_normal', '_400x400');
+  try {
+    const t = await xFetch(`/users/${u.id}/tweets?max_results=100&exclude=retweets&tweet.fields=created_at,public_metrics,referenced_tweets`);
+    out.posts = (t.data || []).map(x => ({ text: x.text, at: x.created_at, likes: x.public_metrics?.like_count || 0, rts: x.public_metrics?.retweet_count || 0 }));
+  } catch (e) { out.postsError = e.message; }
+  return out;
+}
+app.get('/api/import/status', auth, wrap(async (req, res) => {
+  res.json({ profile: req.user.profile || null, meta: req.user.import_meta || null, xApi: !!X_TOKEN, handle: req.user.handle });
+}));
+app.post('/api/import/lookup', auth, wrap(async (req, res) => {
+  const username = String(req.body.username || '').replace(/^@/, '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 15);
+  if (!username) return res.status(400).json({ error: 'Enter an X username' });
+  try { res.json(await lookupX(username)); } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+}));
+app.post('/api/import', auth, wrap(async (req, res) => {
+  const u = req.user, b = req.body;
+  if (!b.confirm) return res.status(400).json({ error: 'Please confirm this is your own account' });
+  const username = String(b.username || '').replace(/^@/, '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 15);
+  if (username.length < 1) return res.status(400).json({ error: 'Username required' });
+  const clean = t => String(t || '').replace(/https?:\/\/t\.co\/\S+/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim().slice(0, 280);
+  let tweets = Array.isArray(b.tweets) ? b.tweets : [];
+  let source = b.source || 'archive';
+  if (!tweets.length && X_TOKEN && b.useApi) { try { tweets = (await lookupX(username)).posts; source = 'x-api'; } catch (e) { return res.status(e.status || 500).json({ error: e.message }); } }
+  tweets = tweets.map(t => ({ text: clean(t.text), at: new Date(t.at), likes: Math.max(0, Number(t.likes) || 0), rts: Math.max(0, Number(t.rts) || 0) }))
+    .filter(t => t.text && !isNaN(t.at) && !/^RT @/.test(t.text)).sort((x, y) => y.at - x.at).slice(0, 500);
+  const likes = (Array.isArray(b.likes) ? b.likes : []).map(clean).filter(Boolean).slice(0, 300);
+  const name = String(b.name || u.name).trim().slice(0, 30) || u.name;
+  const bio = String(b.bio || '').slice(0, 160);
+  const followers = Math.max(0, Math.min(1e9, Math.floor(Number(b.followers) || 0)));
+  let pfp = typeof b.pfp === 'string' && /^https:\/\/[\w.-]+\//.test(b.pfp) ? b.pfp.slice(0, 300) : `https://unavatar.io/x/${username}`;
+  // rename to the X username when it's free (never take a built-in account's handle)
+  if (username.toLowerCase() !== u.handle.toLowerCase()) {
+    const taken = await q1('SELECT 1 FROM accounts WHERE lower(handle)=lower($1) AND id<>$2', [username, u.id]);
+    if (taken) return res.status(409).json({ error: `@${username} is already taken on Z (built-in accounts and other players can't be overwritten)` });
+  }
+  const profile = await ai.genProfile({ name, handle: username, bio, followers, posts: tweets.map(t => t.text), likes });
+  await q('DELETE FROM posts WHERE author_id=$1 AND imported', [u.id]);
+  for (const t of tweets) {
+    await q(`INSERT INTO posts(author_id,text,created_at,likes_target,reposts_target,replies_target,views_target,tau,imported) VALUES($1,$2,$3,$4,$5,0,$6,1,true)`,
+      [u.id, t.text, t.at, t.likes, t.rts, Math.max(t.likes * 20, 50)]);
+  }
+  const meta = { username, source, posts: tweets.length, likes: likes.length, followers, at: new Date().toISOString() };
+  await q(`UPDATE accounts SET handle=$2, name=$3, bio=$4, pfp=$5, profile=$6, import_meta=$7, bonus_followers=$8 WHERE id=$1`,
+    [u.id, username, name, bio, pfp, JSON.stringify(profile), JSON.stringify(meta), Math.max(0, followers - START_FOLLOWERS)]);
+  const fresh = await q1('SELECT * FROM accounts WHERE id=$1', [u.id]);
+  await userFollowers(fresh);
+  res.json({ profile, meta, user: pubAcct(fresh) });
+}));
+app.post('/api/import/forget', auth, wrap(async (req, res) => {
+  await q('DELETE FROM posts WHERE author_id=$1 AND imported', [req.user.id]);
+  await q(`UPDATE accounts SET profile=NULL, import_meta=NULL, bonus_followers=0 WHERE id=$1`, [req.user.id]);
+  res.json({ ok: true });
 }));
 
 // ---------------- the simulation: AI accounts post & reply on their own schedules ----------------
@@ -451,7 +521,7 @@ async function runReplies(pairs, { place }) {
   let n = 0;
   await pool(chunk(pairs, 8), 3, async rawBatch => {
     const batch = rawBatch.map((b, i) => ({ ...b, id: i + 1 })); // ids are local to each LLM call
-    const out = await ai.genAccountReplies(batch.map(b => ({ id: b.id, a: withPersona(b.r), target: { handle: b.c.handle, name: b.c.name, text: b.c.text, isUser: b.c.akind === 'user' } })));
+    const out = await ai.genAccountReplies(batch.map(b => ({ id: b.id, a: withPersona(b.r), target: { handle: b.c.handle, name: b.c.name, text: b.c.text, isUser: b.c.akind === 'user', profile: b.c.profile } })));
     for (const b of batch) {
       const at = place(b);
       const t = targetsFor(b.r);
@@ -468,7 +538,7 @@ async function runReplies(pairs, { place }) {
   });
   return n;
 }
-const CAND_SQL = `SELECT p.id AS pid, p.author_id, p.text, p.likes_target, a.handle, a.name, a.kind, a.kind AS akind FROM posts p JOIN accounts a ON a.id=p.author_id
+const CAND_SQL = `SELECT p.id AS pid, p.author_id, p.text, p.likes_target, a.handle, a.name, a.kind, a.kind AS akind, a.profile FROM posts p JOIN accounts a ON a.id=p.author_id
   WHERE p.parent_id IS NULL AND p.created_at <= now() AND p.created_at > now() - interval '8 hours' ORDER BY p.created_at DESC LIMIT 120`;
 
 async function tick() {

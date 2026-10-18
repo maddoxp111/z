@@ -17,11 +17,14 @@ ALTER TABLE accounts ADD COLUMN IF NOT EXISTS topics TEXT;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS ppd REAL DEFAULT 1;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS rpd REAL DEFAULT 0.5;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS tuned BOOLEAN DEFAULT false;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile JSONB;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS import_meta JSONB;
 CREATE TABLE IF NOT EXISTS posts(
   id SERIAL PRIMARY KEY, author_id INT NOT NULL REFERENCES accounts(id), text TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT now(), likes_target BIGINT DEFAULT 0, reposts_target BIGINT DEFAULT 0,
   replies_target BIGINT DEFAULT 0, views_target BIGINT DEFAULT 0, tau INT DEFAULT 900,
   parent_id INT, quote_of INT, replies_gen INT DEFAULT 0, viral BOOLEAN DEFAULT false);
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS imported BOOLEAN DEFAULT false;
 CREATE INDEX IF NOT EXISTS posts_created ON posts(created_at DESC);
 CREATE INDEX IF NOT EXISTS posts_parent ON posts(parent_id);
 CREATE INDEX IF NOT EXISTS posts_author ON posts(author_id, created_at DESC);

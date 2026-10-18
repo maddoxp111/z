@@ -137,7 +137,7 @@ async function refreshRight() {
     <div class="sbox"><div style="position:relative">${svg('search')}<input id="sq" placeholder="Search" autocomplete="off"></div></div>
     <div class="card"><h2>Your fame</h2><div style="padding:0 16px 16px"><b style="font-size:24px" id="fameN">${me.followers.toLocaleString()}</b> <span class="mute">followers</span>
       <div class="bar fame" style="margin:8px 0 0;padding:0;border:0"><div class="bar"><i style="width:${pct}%"></i></div></div>
-      <small class="mute">${me.verified === 'blue' ? 'Verified ✔ — you made it.' : `${compact(goal - me.followers)} to go until you're verified (${compact(goal)})`}</small></div></div>
+      <small class="mute"><a href="#/import" style="color:var(--blue)">Import your X account →</a><br>${me.verified === 'blue' ? 'Verified ✔ — you made it.' : `${compact(goal - me.followers)} to go until you're verified (${compact(goal)})`}</small></div></div>
     <div class="card"><h2>What's happening</h2>${ex.trends.slice(0, 6).map(t => `<div class="it" data-go="#/search?q=${encodeURIComponent(t.topic)}"><small>${esc(t.cat)}</small><b>${esc(t.topic)}</b><small>${esc(t.posts)} posts</small></div>`).join('')}</div>
     <div class="card"><h2>Who to follow</h2>${ex.suggest.map(a => `<div class="who2">${av(a)}<div class="info"><a href="#/u/${esc(a.handle)}"><b>${esc(a.name)}${verified(a.verified)}</b><span class="mute">@${esc(a.handle)}</span></a></div><button class="btn w" data-follow="${esc(a.handle)}">Follow</button></div>`).join('')}</div>
     <div class="foot">Z is a parody. Every account except yours is AI-generated fiction — nothing here is real, said, or endorsed by anyone named. Profile names, handles and photos mirror public X profiles for the fun of it.</div>`;
@@ -236,7 +236,7 @@ async function viewProfile(handle, tab = 'posts') {
   const h = hue(a.handle);
   main().innerHTML = `<div class="hdr"><div class="title"><span class="back" data-back>${svg('back')}</span><div style="line-height:1.2">${esc(a.name)}${verified(a.verified)}<div class="mute" style="font-size:13px;font-weight:400">${r.posts.length} posts</div></div></div></div>
     <div class="banner" style="background:linear-gradient(135deg,hsl(${h},40%,22%),hsl(${(h + 60) % 360},45%,12%))"></div>
-    <div class="prof"><div class="top">${av(a, 'l')}<div style="display:flex;gap:8px;margin-top:12px">${r.me ? '' : `<button class="btn o" data-dm="${esc(a.handle)}" title="Message">${svg('mail')}</button><button class="btn ${r.following ? 'o' : 'w'}" data-follow="${esc(a.handle)}" id="fbtn">${r.following ? 'Following' : 'Follow'}</button>`}</div></div>
+    <div class="prof"><div class="top">${av(a, 'l')}<div style="display:flex;gap:8px;margin-top:12px">${r.me ? `<a class="btn o" href="#/import">Import from X</a>` : `<button class="btn o" data-dm="${esc(a.handle)}" title="Message">${svg('mail')}</button><button class="btn ${r.following ? 'o' : 'w'}" data-follow="${esc(a.handle)}" id="fbtn">${r.following ? 'Following' : 'Follow'}</button>`}</div></div>
     <h1>${esc(a.name)}${verified(a.verified)}</h1><div class="mute">@${esc(a.handle)}</div>
     ${a.bio ? `<p style="margin:12px 0 0">${linkify(a.bio)}</p>` : ''}
     <div class="stats"><span><b>${compact(a.following)}</b> Following</span><span><b id="pf">${a.followers.toLocaleString()}</b> Followers</span></div></div>
@@ -307,6 +307,80 @@ async function viewChat(handle) {
   await draw(true);
   clearInterval(chatTimer); chatTimer = setInterval(() => draw(false).catch(() => { }), 3000);
   pollNow();
+}
+
+// ---------- import from X ----------
+async function readArchive(files) {
+  const out = { tweets: [], likes: [], followers: null, name: null, bio: null, username: null, pfp: null, files: [] };
+  for (const f of files) {
+    const n = f.name.toLowerCase();
+    const txt = await f.text();
+    const i = txt.indexOf('['); if (i < 0) continue;
+    let arr; try { arr = JSON.parse(txt.slice(i)); } catch { continue; }
+    if (/^tweets?(-part\d+)?\.js$/.test(n)) { arr.forEach(x => { const t = x.tweet || x; out.tweets.push({ text: t.full_text || t.text, at: t.created_at, likes: +t.favorite_count || 0, rts: +t.retweet_count || 0 }); }); out.files.push(f.name); }
+    else if (/^likes?\.js$/.test(n)) { arr.forEach(x => { const l = x.like || x; if (l.fullText) out.likes.push(l.fullText); }); out.files.push(f.name); }
+    else if (/^followers?\.js$/.test(n)) { out.followers = arr.length; out.files.push(f.name); }
+    else if (n === 'account.js') { const a = arr[0]?.account; if (a) { out.username = a.username; out.name = a.accountDisplayName; out.files.push(f.name); } }
+    else if (n === 'profile.js') { const p = arr[0]?.profile; if (p) { out.bio = p.description?.bio; out.pfp = p.avatarMediaUrl; out.files.push(f.name); } }
+  }
+  return out;
+}
+async function viewImport() {
+  const st = await api('/import/status');
+  const profCard = (pr, meta) => `<div class="card" style="margin:12px 16px"><h2>What Z knows about you</h2><div style="padding:0 16px 16px;line-height:1.45">
+      <p style="margin-top:0">${esc(pr.summary)}</p>
+      ${pr.voice ? `<p><b>How you write:</b> ${esc(pr.voice)}</p>` : ''}${pr.humor ? `<p><b>Humor:</b> ${esc(pr.humor)}</p>` : ''}
+      ${(pr.topics || []).length ? `<p><b>Topics:</b> ${pr.topics.map(esc).join(' · ')}</p>` : ''}${(pr.quirks || []).length ? `<p><b>Quirks:</b> ${pr.quirks.map(esc).join(' · ')}</p>` : ''}
+      ${meta ? `<p class="mute" style="font-size:13px;margin-bottom:0">Imported ${meta.posts} posts, ${meta.likes} likes, ${Number(meta.followers).toLocaleString()} followers from @${esc(meta.username)} (${meta.source === 'x-api' ? 'X API' : 'X data archive'}). Every AI account now reacts to this.</p>` : ''}</div></div>`;
+  const inp = (id, label, val = '', extra = '') => `<label style="display:block;margin:10px 0;color:var(--mute);font-size:13px">${label}<input id="${id}" value="${esc(val)}" ${extra} style="display:block;width:100%;margin-top:4px;background:var(--bg2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:10px;font:inherit"></label>`;
+  main().innerHTML = `<div class="hdr"><div class="title"><span class="back" data-back>${svg('back')}</span>Import from X</div></div>
+    ${st.profile ? profCard(st.profile, st.meta) : ''}
+    <div class="card" style="margin:12px 16px"><h2>${st.profile ? 'Re-import' : 'Bring your X account to Z'}</h2><div style="padding:0 16px 16px">
+      <p class="mute" style="margin-top:0">Your name, username, profile picture, bio, follower count and posts come over, and the AI builds a profile of you so the fake people (and celebs) respond like they know you. Nothing is posted to X.</p>
+      <b>1 · Username</b>
+      <div style="display:flex;gap:8px;margin:8px 0"><input id="iu" placeholder="@yourusername" value="${esc(st.meta?.username || '')}" style="flex:1;background:var(--bg2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:10px;font:inherit"><button class="btn" id="ilook">Look up</button></div>
+      <div id="iprev" class="mute" style="font-size:13px">${st.xApi ? 'X API connected — public profile and recent posts can be fetched by username.' : 'Without an X API token Z can only fetch your profile picture by username. Add the archive below for everything else.'}</div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+      <b>2 · Your X archive <span class="mute" style="font-weight:400">(recommended — gets posts, likes &amp; followers)</span></b>
+      <ol class="mute" style="font-size:13px;line-height:1.6;padding-left:18px"><li>On X: <i>Settings → Your account → Download an archive of your data</i>. X emails you a zip within ~24h.</li><li>Unzip it and open the <code>data</code> folder.</li><li>Select these files here (any that exist): <code>tweets.js</code>, <code>like.js</code>, <code>follower.js</code>, <code>account.js</code>, <code>profile.js</code>.</li></ol>
+      <input type="file" id="ifiles" multiple accept=".js">
+      <div id="iarch" class="mute" style="font-size:13px;margin-top:8px"></div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+      <b>3 · Check &amp; import</b>
+      ${inp('in', 'Display name', me.name, 'maxlength="30"')}${inp('ib', 'Bio', me.bio || '', 'maxlength="160"')}${inp('if', 'Followers', '', 'type="number" min="0" placeholder="e.g. 4210"')}
+      ${st.xApi ? '<label style="display:block;margin:8px 0"><input type="checkbox" id="iapi" checked> Also pull my recent public posts from X by username</label>' : ''}
+      <label style="display:block;margin:8px 0"><input type="checkbox" id="iok"> This is my own X account. I’m importing my own data.</label>
+      <div style="display:flex;gap:8px;align-items:center"><button class="btn" id="igo">Import</button>${st.profile ? '<button class="btn o" id="iforget">Forget imported data</button>' : ''}<span id="imsg" class="mute"></span></div>
+    </div></div>`;
+  let arch = null, look = null, pfp = null;
+  $('#ilook').onclick = async () => {
+    const u = $('#iu').value.trim(); if (!u) return;
+    $('#iprev').textContent = 'Looking up…';
+    try {
+      look = await api('/import/lookup', 'POST', { username: u }); pfp = look.pfp;
+      $('#iprev').innerHTML = `<div style="display:flex;gap:12px;align-items:center;color:var(--text)">${av({ name: look.name || u, handle: u, pfp: look.pfp })}<div><b>${esc(look.name || '@' + look.username)}</b><div class="mute">@${esc(look.username)}${look.followers != null ? ' · ' + look.followers.toLocaleString() + ' followers' : ''}${look.posts.length ? ' · ' + look.posts.length + ' recent posts found' : ''}</div></div></div>${look.postsError ? '<div class="mute">' + esc(look.postsError) + '</div>' : ''}`;
+      if (look.name) $('#in').value = look.name; if (look.bio) $('#ib').value = look.bio; if (look.followers != null) $('#if').value = look.followers;
+    } catch (e) { $('#iprev').textContent = e.message; }
+  };
+  $('#ifiles').onchange = async e => {
+    arch = await readArchive([...e.target.files]);
+    $('#iarch').textContent = arch.files.length ? `Read ${arch.files.join(', ')} → ${arch.tweets.length} posts, ${arch.likes.length} likes${arch.followers != null ? ', ' + arch.followers.toLocaleString() + ' followers' : ''}.` : 'No recognised archive files found.';
+    if (arch.username && !$('#iu').value) $('#iu').value = arch.username;
+    if (arch.name) $('#in').value = arch.name; if (arch.bio) $('#ib').value = arch.bio; if (arch.followers != null) $('#if').value = arch.followers;
+    if (arch.pfp) pfp = arch.pfp;
+  };
+  $('#igo').onclick = async () => {
+    const btn = $('#igo'); btn.disabled = true; $('#imsg').textContent = 'Importing and reading your posts… (about 10 seconds)';
+    try {
+      const r = await api('/import', 'POST', {
+        username: $('#iu').value, name: $('#in').value, bio: $('#ib').value, followers: +$('#if').value || 0, pfp, confirm: $('#iok').checked,
+        tweets: arch ? arch.tweets : (look?.posts || []), likes: arch ? arch.likes : [], source: arch ? 'archive' : 'x-api', useApi: $('#iapi')?.checked,
+      });
+      me = await api('/me'); renderMe(); $('#profnav').href = '#/u/' + me.handle; refreshRight().catch(() => { });
+      toast('✅ Imported — the AI knows you now'); viewImport();
+    } catch (e) { $('#imsg').textContent = e.message; btn.disabled = false; }
+  };
+  const fg = $('#iforget'); if (fg) fg.onclick = async () => { if (confirm('Remove imported posts and your AI profile?')) { await api('/import/forget', 'POST'); me = await api('/me'); refreshRight().catch(() => { }); viewImport(); } };
 }
 
 // ---------- sim ----------
@@ -387,6 +461,7 @@ async function route() {
     else if (seg[0] === 'messages') await viewMessages(seg[1]);
     else if (seg[0] === 'post') await viewPost(seg[1]);
     else if (seg[0] === 'sim') await viewSim();
+    else if (seg[0] === 'import') await viewImport();
     else if (seg[0] === 'u') await viewProfile(seg[1], seg[2]);
     else await viewHome();
   } catch (e) { console.error(e); if (e.message !== 'auth') main().innerHTML = '<div class="empty">Something went wrong. Try again.</div>'; }
